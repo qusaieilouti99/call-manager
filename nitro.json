@@ -1,0 +1,17 @@
+{
+  "cxxNamespace": ["qusaieilouti99_callmanager"],
+  "ios": {
+    "iosModuleName": "CallManager"
+  },
+  "android": {
+    "androidNamespace": ["qusaieilouti99","callmanager"],
+    "androidCxxLibName": "qusaieilouti99_callmanager"
+  },
+  "autolinking": {
+    "CallManager": {
+      "swift": "CallManager",
+      "kotlin": "CallManager"
+    }
+  },
+  "ignorePaths": ["node_modules"]
+}

@@ -1,0 +1,36 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity
+                android:name=".CallActivity"
+                android:exported="true"
+                android:showOnLockScreen="true"
+                android:turnScreenOn="true"
+                android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+                android:screenOrientation="portrait"
+                android:launchMode="singleTop"
+                android:excludeFromRecents="true"
+                android:taskAffinity=""
+                android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+            </intent-filter>
+        </activity>
+        <service
+                android:name=".MyConnectionService"
+                android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE"
+                android:exported="true">
+            <intent-filter>
+                <action android:name="android.telecom.ConnectionService" />
+            </intent-filter>
+        </service>
+        <service
+                android:name=".CallForegroundService"
+                android:enabled="true"
+                android:exported="false"
+                android:foregroundServiceType="phoneCall" />
+        <receiver
+                android:name=".CallNotificationActionReceiver"
+                android:exported="false" />
+    </application>
+</manifest>

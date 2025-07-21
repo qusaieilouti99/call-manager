@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/call_root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="#222"
+              android:orientation="vertical"
+              android:gravity="center"
+              android:padding="32dp">
+
+    <ImageView
+            android:id="@+id/avatar"
+            android:layout_width="96dp"
+            android:layout_height="96dp"
+            android:layout_marginBottom="24dp"
+            android:src="@android:drawable/sym_def_app_icon"
+            android:background="@drawable/circle_bg"
+            android:scaleType="centerCrop" />
+
+    <TextView
+            android:id="@+id/caller_name"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Caller Name"
+            android:textColor="#fff"
+            android:textSize="24sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="48dp" />
+
+    <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center">
+
+        <Button
+                android:id="@+id/decline_btn"
+                android:layout_width="72dp"
+                android:layout_height="72dp"
+                android:backgroundTint="#D32F2F"
+                android:text="Decline"
+                android:textColor="#fff"
+                android:background="@drawable/circle_red"
+                android:layout_marginEnd="32dp" />
+
+        <Button
+                android:id="@+id/answer_btn"
+                android:layout_width="72dp"
+                android:layout_height="72dp"
+                android:backgroundTint="#388E3C"
+                android:text="Answer"
+                android:textColor="#fff"
+                android:background="@drawable/circle_green" />
+    </LinearLayout>
+</LinearLayout>
