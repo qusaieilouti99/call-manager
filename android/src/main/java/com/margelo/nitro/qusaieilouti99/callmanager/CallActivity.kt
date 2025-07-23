@@ -1,37 +1,56 @@
-// CallActivity.kt
 package com.margelo.nitro.qusaieilouti99.callmanager
+
 import android.app.Activity
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.TextView
 
 class CallActivity : Activity() {
 
-    private enum class FinishReason { ANSWER, DECLINE, TIMEOUT, MANUAL }
+    private enum class FinishReason { ANSWER, DECLINE, TIMEOUT, MANUAL_DISMISS }
     private var finishReason: FinishReason? = null
+    private var callId: String = ""
+    private var callType: String = "Audio"
 
     private val timeoutHandler = Handler(Looper.getMainLooper())
     private val timeoutRunnable = Runnable {
+        Log.d(TAG, "CallActivity timeout triggered for callId: $callId")
         finishReason = FinishReason.TIMEOUT
+        CallEngine.endCall(this, callId)
         finishCallActivity()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(
-            WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-            WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
-            WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
-        )
+        Log.d(TAG, "CallActivity onCreate")
+
+        // Modern way to handle lock screen bypass (API 27+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            // Legacy approach for older versions
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
+            )
+        }
+
         setContentView(R.layout.activity_call)
 
+        callId = intent.getStringExtra("callId") ?: ""
+        callType = intent.getStringExtra("callType") ?: "Audio"
+        Log.d(TAG, "CallActivity received callId: $callId, callType: $callType")
+
+        // FIXED: Immediate cleanup of notifications when CallActivity is shown
         CallEngine.cancelIncomingCallUI(this)
-        CallEngine.playRingtone(this)
 
         val callerName = intent.getStringExtra("callerName") ?: "Unknown"
         val nameView = findViewById<TextView>(R.id.caller_name)
@@ -41,14 +60,18 @@ class CallActivity : Activity() {
         nameView.text = callerName
 
         answerBtn.setOnClickListener {
-            CallEngine.bringAppToForeground(this)
+            Log.d(TAG, "CallActivity: Answer button clicked for callId: $callId")
             finishReason = FinishReason.ANSWER
+
+            // FIXED: Use single source of truth - this will handle all cleanup
+            CallEngine.answerCall(this, callId)
             finishCallActivity()
         }
 
         declineBtn.setOnClickListener {
-            CallEngine.cancelIncomingCallUI(this)
+            Log.d(TAG, "CallActivity: Decline button clicked for callId: $callId")
             finishReason = FinishReason.DECLINE
+            CallEngine.endCall(this, callId)
             finishCallActivity()
         }
 
@@ -57,26 +80,31 @@ class CallActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        Log.d(TAG, "CallActivity onDestroy for callId: $callId. Reason: $finishReason")
         timeoutHandler.removeCallbacks(timeoutRunnable)
+
+        // FIXED: Ensure cleanup happens regardless of how activity ends
         CallEngine.stopRingtone()
         CallEngine.cancelIncomingCallUI(this)
-        // Only clean up call if not answered
-        if (finishReason == FinishReason.DECLINE || finishReason == FinishReason.TIMEOUT || finishReason == FinishReason.MANUAL) {
-            CallEngine.stopForegroundService(this)
-            CallEngine.disconnectTelecomCall(this, intent.getStringExtra("callId") ?: "")
-        }
     }
 
     override fun onBackPressed() {
-        finishReason = FinishReason.MANUAL
+        Log.d(TAG, "CallActivity onBackPressed for callId: $callId. Treating as decline/dismiss.")
+        finishReason = FinishReason.MANUAL_DISMISS
+        CallEngine.endCall(this, callId)
         finishCallActivity()
     }
 
     private fun finishCallActivity() {
+        Log.d(TAG, "Finishing CallActivity.")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             finishAndRemoveTask()
         } else {
             finish()
         }
+    }
+
+    companion object {
+        private const val TAG = "CallActivity"
     }
 }
