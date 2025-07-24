@@ -1,5 +1,6 @@
 package com.margelo.nitro.qusaieilouti99.callmanager
 
+import android.app.ActivityManager
 import android.app.Activity
 import android.app.Application
 import android.app.Notification
@@ -1001,16 +1002,25 @@ object CallEngine {
         val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val tasks = activityManager.getAppTasks()
-            if (tasks.isNotEmpty()) {
-                val taskInfo = tasks[0].taskInfo
-                return taskInfo.topActivity?.className?.contains("MainActivity") == true
+            try {
+                val tasks = activityManager.appTasks
+                if (tasks.isNotEmpty()) {
+                    val taskInfo = tasks[0].taskInfo
+                    return taskInfo.topActivity?.className?.contains("MainActivity") == true
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to get app tasks: ${e.message}")
             }
         } else {
-            @Suppress("DEPRECATION")
-            val tasks = activityManager.getRunningTasks(1)
-            if (tasks.isNotEmpty()) {
-                return tasks[0].topActivity?.className?.contains("MainActivity") == true
+            try {
+                @Suppress("DEPRECATION")
+                val tasks = activityManager.getRunningTasks(1)
+                if (tasks.isNotEmpty()) {
+                    val runningTaskInfo = tasks[0]
+                    return runningTaskInfo.topActivity?.className?.contains("MainActivity") == true
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to get running tasks: ${e.message}")
             }
         }
         return false

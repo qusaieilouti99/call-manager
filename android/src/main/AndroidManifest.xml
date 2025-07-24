@@ -18,5 +18,8 @@
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
+
+    <!-- For knowing the activity state-->
+    <uses-permission android:name="android.permission.GET_TASKS" />
     <!-- No components needed here - they're declared in app manifest -->
 </manifest>
