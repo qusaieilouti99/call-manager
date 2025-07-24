@@ -12,14 +12,18 @@ export interface CallManager extends HybridObject<{ ios: 'swift'; android: 'kotl
   // Call control
   endCall(callId: string): void;
   silenceRingtone(): void;
-  // Removed `callType` parameter as it's now expected inside `callData`
-  startOutgoingCall(callId: string, callData: string): void;
   callAnswered(callId: string): void; // To signal remote party answered and stop ringback
 
   // Audio/device/screen APIs
   getAudioDevices(): AudioRoutesInfo; // Return type changed to structured AudioDeviceInfo
   setAudioRoute(route: string): void;
   keepScreenAwake(keepAwake: boolean): void;
+
+  endAllCalls(): void;
+  startOutgoingCall(callId: string, callType: string, targetName: string, metadata?: string): void;
+  startCall(callId: string, callType: string, targetName: string, metadata?: string): void;
+  setOnHold(callId: string, onHold: boolean): void;
+  setMuted(callId: string, muted: boolean): void;
 
   // Event emitter: addListener returns a remove function
   addListener(

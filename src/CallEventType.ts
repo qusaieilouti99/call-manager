@@ -1,8 +1,6 @@
 // CallEventType.ts
 export type CallEventType =
-  | 'INITIAL_CALL_STATE'
-  | 'CALL_STATE_CHANGED'
-  | 'AUDIO_DEVICES_CHANGED'
+  'AUDIO_DEVICES_CHANGED'
   | 'AUDIO_ROUTE_CHANGED'
   | 'CALL_HELD'
   | 'CALL_UNHELD'
@@ -10,6 +8,7 @@ export type CallEventType =
   | 'CALL_MUTED'
   | 'CALL_UNMUTED'
   | 'CALL_ANSWERED'
+  | 'OUTGOING_CALL_ANSWERED'
   | 'CALL_REJECTED'
   | 'CALL_ENDED'
   | 'DTMF_TONE'; // ADD THIS LINE IF YOU NEED DTMF EVENTS

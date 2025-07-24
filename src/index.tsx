@@ -22,8 +22,39 @@ export const keepScreenAwake = (keepAwake: boolean) => {
   CallManagerHybridObject.keepScreenAwake(keepAwake);
 };
 
-export const startOutgoingCall = (callId: string, callData: string) => {
-  CallManagerHybridObject.startOutgoingCall(callId, callData);
+export const startOutgoingCall = (
+  callId: string,
+  callType: string,
+  targetName: string,
+  metadata?: string
+) => {
+  CallManagerHybridObject.startOutgoingCall(
+    callId,
+    callType,
+    targetName,
+    metadata
+  );
+};
+
+export const startCall = (
+  callId: string,
+  callType: string,
+  targetName: string,
+  metadata?: string
+) => {
+  CallManagerHybridObject.startCall(callId, callType, targetName, metadata);
+};
+
+export const endAllCalls = () => {
+  CallManagerHybridObject.endAllCalls();
+};
+
+export const setOnHold = (callId: string, onHold: boolean) => {
+  CallManagerHybridObject.setOnHold(callId, onHold);
+};
+
+export const setMuted = (callId: string, muted: boolean) => {
+  CallManagerHybridObject.setMuted(callId, muted);
 };
 
 export const callAnswered = (callId: string) => {

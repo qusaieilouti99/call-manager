@@ -11,7 +11,6 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import org.json.JSONObject
 
 class CallForegroundService : Service() {
 
@@ -30,16 +29,14 @@ class CallForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "Service onStartCommand")
 
-        // Check if we have call info in the intent
         val callId = intent?.getStringExtra("callId")
-        val callData = intent?.getStringExtra("callData")
+        val callType = intent?.getStringExtra("callType")
+        val displayName = intent?.getStringExtra("displayName")
         val state = intent?.getStringExtra("state")
 
-        val notification = if (callId != null && callData != null && state != null) {
-            Log.d(TAG, "Building enhanced notification with call info: $callId")
-            buildEnhancedNotification(callId, callData, state)
+        val notification = if (callId != null && callType != null && displayName != null && state != null) {
+            buildEnhancedNotification(callId, callType, displayName, state)
         } else {
-            Log.d(TAG, "Building basic notification - no call info available")
             buildBasicNotification()
         }
 
@@ -47,14 +44,9 @@ class CallForegroundService : Service() {
         return START_STICKY
     }
 
-    override fun onBind(intent: Intent?): IBinder? {
-        Log.d(TAG, "Service onBind")
-        return null
-    }
+    override fun onBind(intent: Intent?): IBinder? = null
 
     private fun buildBasicNotification(): Notification {
-        Log.d(TAG, "Building basic foreground notification.")
-
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Call Service")
             .setContentText("Call service is running...")
@@ -62,26 +54,12 @@ class CallForegroundService : Service() {
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-            .setWhen(System.currentTimeMillis())
             .build()
     }
 
-    private fun buildEnhancedNotification(callId: String, callData: String, state: String): Notification {
-        Log.d(TAG, "Building enhanced foreground notification for callId: $callId, state: $state")
+    private fun buildEnhancedNotification(callId: String, callType: String, displayName: String, state: String): Notification {
+        Log.d(TAG, "Building notification for callId: $callId, state: $state")
 
-        val callerName = try {
-            JSONObject(callData).optString("name", "Unknown Caller")
-        } catch (e: Exception) {
-            "Unknown Caller"
-        }
-
-        val callType = try {
-            JSONObject(callData).optString("callType", "Audio")
-        } catch (e: Exception) {
-            "Audio"
-        }
-
-        // Create end call action
         val endCallIntent = Intent(this, CallNotificationActionReceiver::class.java).apply {
             action = "com.qusaieilouti99.callmanager.END_CALL"
             putExtra("callId", callId)
@@ -91,7 +69,6 @@ class CallForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        // Create hold/unhold action based on current state
         val isHeld = state == "HELD"
         val holdAction = if (isHeld) "UNHOLD_CALL" else "HOLD_CALL"
         val holdText = if (isHeld) "Resume" else "Hold"
@@ -105,23 +82,12 @@ class CallForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        // Create main activity intent
-        val mainIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        }
-        val mainPendingIntent = mainIntent?.let {
-            PendingIntent.getActivity(
-                this, 102, it,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-        }
-
         val statusText = when (state) {
-            "ACTIVE" -> "$callerName"
-            "HELD" -> "$callerName (on hold)"
-            "DIALING" -> "Calling $callerName..."
-            "INCOMING" -> "Incoming call from $callerName"
-            else -> callerName
+            "ACTIVE" -> displayName
+            "HELD" -> "$displayName (on hold)"
+            "DIALING" -> "Calling $displayName..."
+            "INCOMING" -> "Incoming call from $displayName"
+            else -> displayName
         }
 
         val titleText = when (state) {
@@ -139,9 +105,8 @@ class CallForegroundService : Service() {
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setWhen(System.currentTimeMillis())
 
-        // Add actions for ACTIVE and HELD calls only
+        // Add action buttons for ACTIVE and HELD calls
         if (state == "ACTIVE" || state == "HELD") {
             notificationBuilder
                 .addAction(
@@ -155,17 +120,11 @@ class CallForegroundService : Service() {
                     endCallPendingIntent
                 )
         } else if (state == "DIALING") {
-            // For dialing calls, only show end call
             notificationBuilder.addAction(
                 android.R.drawable.sym_call_outgoing,
                 "End Call",
                 endCallPendingIntent
             )
-        }
-
-        // Set content intent to open the main app
-        mainPendingIntent?.let {
-            notificationBuilder.setContentIntent(it)
         }
 
         return notificationBuilder.build()
@@ -185,20 +144,28 @@ class CallForegroundService : Service() {
 
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.createNotificationChannel(channel)
-            Log.d(TAG, "Foreground notification channel '$CHANNEL_ID' created/updated.")
         }
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Log.d(TAG, "onTaskRemoved: User swiped app from recents. Ending all calls.")
-        CallEngine.endAllCalls(this)
+        val removed = rootIntent?.component?.className
+        Log.d(TAG, "onTaskRemoved: $removed")
+
+        // Only terminate if main app was removed, not CallActivity
+        if (removed != CallActivity::class.java.name) {
+            Log.d(TAG, "Main app task removed - terminating")
+            CallEngine.onApplicationTerminate()
+        }
+
         super.onTaskRemoved(rootIntent)
-        stopSelf()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        Log.d(TAG, "Service onDestroy. Stopping foreground.")
+        Log.d(TAG, "Service onDestroy")
         stopForeground(true)
+
+        // SIMPLIFIED: Don't call onApplicationTerminate here
+        // Only onTaskRemoved should trigger app termination
     }
 }

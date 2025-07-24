@@ -22,24 +22,24 @@ class CallNotificationActionReceiver : BroadcastReceiver() {
                     Log.d(TAG, "Call answered via Telecom connection for callId: $callId")
                 } else {
                     Log.e(TAG, "No Telecom connection found for callId: $callId. Using direct answer.")
-                    CallEngine.answerCall(context, callId)
+                    CallEngine.answerCall(callId)
                 }
             }
             "com.qusaieilouti99.callmanager.DECLINE_CALL" -> {
                 Log.d(TAG, "Decline action received for callId: $callId")
-                CallEngine.endCall(context, callId)
+                CallEngine.endCall(callId)
             }
             "com.qusaieilouti99.callmanager.END_CALL" -> {
                 Log.d(TAG, "End call action received for callId: $callId")
-                CallEngine.endCall(context, callId)
+                CallEngine.endCall(callId)
             }
             "com.qusaieilouti99.callmanager.HOLD_CALL" -> {
                 Log.d(TAG, "Hold call action received for callId: $callId")
-                CallEngine.holdCall(context, callId)
+                CallEngine.holdCall(callId)
             }
             "com.qusaieilouti99.callmanager.UNHOLD_CALL" -> {
                 Log.d(TAG, "Unhold call action received for callId: $callId")
-                CallEngine.unholdCall(context, callId)
+                CallEngine.unholdCall(callId)
             }
             else -> {
                 Log.w(TAG, "Unknown action received: ${intent.action}")

@@ -22,7 +22,7 @@ class CallActivity : Activity() {
     private val timeoutRunnable = Runnable {
         Log.d(TAG, "CallActivity timeout triggered for callId: $callId")
         finishReason = FinishReason.TIMEOUT
-        CallEngine.endCall(this, callId)
+        CallEngine.endCall(callId)
         finishCallActivity()
     }
 
@@ -50,7 +50,7 @@ class CallActivity : Activity() {
         Log.d(TAG, "CallActivity received callId: $callId, callType: $callType")
 
         // FIXED: Immediate cleanup of notifications when CallActivity is shown
-        CallEngine.cancelIncomingCallUI(this)
+        CallEngine.cancelIncomingCallUI()
 
         val callerName = intent.getStringExtra("callerName") ?: "Unknown"
         val nameView = findViewById<TextView>(R.id.caller_name)
@@ -64,14 +64,14 @@ class CallActivity : Activity() {
             finishReason = FinishReason.ANSWER
 
             // FIXED: Use single source of truth - this will handle all cleanup
-            CallEngine.answerCall(this, callId)
+            CallEngine.answerCall(callId)
             finishCallActivity()
         }
 
         declineBtn.setOnClickListener {
             Log.d(TAG, "CallActivity: Decline button clicked for callId: $callId")
             finishReason = FinishReason.DECLINE
-            CallEngine.endCall(this, callId)
+            CallEngine.endCall(callId)
             finishCallActivity()
         }
 
@@ -85,13 +85,13 @@ class CallActivity : Activity() {
 
         // FIXED: Ensure cleanup happens regardless of how activity ends
         CallEngine.stopRingtone()
-        CallEngine.cancelIncomingCallUI(this)
+        CallEngine.cancelIncomingCallUI()
     }
 
     override fun onBackPressed() {
         Log.d(TAG, "CallActivity onBackPressed for callId: $callId. Treating as decline/dismiss.")
         finishReason = FinishReason.MANUAL_DISMISS
-        CallEngine.endCall(this, callId)
+        CallEngine.endCall(callId)
         finishCallActivity()
     }
 

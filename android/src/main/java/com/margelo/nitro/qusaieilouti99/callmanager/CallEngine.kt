@@ -1,11 +1,11 @@
 package com.margelo.nitro.qusaieilouti99.callmanager
 
 import android.app.Activity
+import android.app.Application
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.app.Service
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -13,7 +13,6 @@ import android.graphics.Color
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
-import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.RingtoneManager
@@ -31,12 +30,8 @@ import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
 import android.telecom.VideoProfile
 import android.util.Log
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -45,30 +40,29 @@ object CallEngine {
     private const val PHONE_ACCOUNT_ID = "com.qusaieilouti99.callmanager.SELF_MANAGED"
     private const val NOTIF_CHANNEL_ID = "incoming_call_channel"
     private const val NOTIF_ID = 2001
-    private const val FOREGROUND_CHANNEL_ID = "call_foreground_channel"
-    private const val FOREGROUND_NOTIF_ID = 1001
 
-    // Audio & Media
+    // Core context - initialized once and maintained
+    @Volatile
+    private var appContext: Context? = null
+    private val isInitialized = AtomicBoolean(false)
+    private val initializationLock = Any()
+
+    // Simplified Audio & Media Management (NO MANUAL AUDIO FOCUS)
     private var ringtone: android.media.Ringtone? = null
     private var ringbackPlayer: MediaPlayer? = null
     private var audioManager: AudioManager? = null
     private var wakeLock: PowerManager.WakeLock? = null
-    private var appContext: Context? = null
-    private var audioFocusRequest: AudioFocusRequest? = null
 
     // Call State Management
     private val activeCalls = ConcurrentHashMap<String, CallInfo>()
     private val telecomConnections = ConcurrentHashMap<String, Connection>()
+    private val callMetadata = ConcurrentHashMap<String, String>()
+
     private var currentCallId: String? = null
     private var canMakeMultipleCalls: Boolean = false
 
     // Audio State Tracking
     private var lastAudioRoutesInfo: AudioRoutesInfo? = null
-    private var lastMuteState: Boolean = false
-    private var hasAudioFocus: Boolean = false
-
-    // System Call State Tracking
-    private var isSystemCallActive: Boolean = false
 
     // Lock Screen Bypass
     private var lockScreenBypassActive = false
@@ -78,141 +72,31 @@ object CallEngine {
     private var eventHandler: ((CallEventType, String) -> Unit)? = null
     private val cachedEvents = mutableListOf<Pair<CallEventType, String>>()
 
-    // Operation State
-    private val operationInProgress = AtomicBoolean(false)
-
-    data class CallInfo(
-        val callId: String,
-        val callData: String,
-        var state: CallState,
-        val callType: String = "Audio",
-        val timestamp: Long = System.currentTimeMillis(),
-        var wasHeldBySystem: Boolean = false
-    )
-
-    enum class CallState {
-        INCOMING, DIALING, ACTIVE, HELD, ENDED
-    }
-
     interface LockScreenBypassCallback {
         fun onLockScreenBypassChanged(shouldBypass: Boolean)
     }
 
-    // --- Audio Focus Management ---
-    private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
-        Log.d(TAG, "Audio focus changed: $focusChange")
-        when (focusChange) {
-            AudioManager.AUDIOFOCUS_LOSS -> {
-                handleAudioFocusLoss()
-            }
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                handleAudioFocusLoss()
-            }
-            AudioManager.AUDIOFOCUS_GAIN -> {
-                handleAudioFocusGain()
-            }
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                // Can duck audio - don't hold call
-                Log.d(TAG, "Audio focus loss - can duck, not holding call")
+    // --- INITIALIZATION ---
+    fun initialize(context: Context) {
+        synchronized(initializationLock) {
+            if (isInitialized.compareAndSet(false, true)) {
+                appContext = context.applicationContext
+                audioManager = appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                Log.d(TAG, "CallEngine initialized successfully")
+
+                if (isCallActive()) {
+                    startForegroundService()
+                }
             }
         }
     }
 
-    private fun handleAudioFocusLoss() {
-        Log.d(TAG, "Audio focus lost - likely system call active")
-        hasAudioFocus = false
-        isSystemCallActive = true
+    fun isInitialized(): Boolean = isInitialized.get()
 
-        // Hold all active calls instead of ending them
-        activeCalls.values.filter { it.state == CallState.ACTIVE }.forEach { call ->
-            if (!call.wasHeldBySystem) {
-                call.wasHeldBySystem = true
-                call.state = CallState.HELD
-
-                val connection = telecomConnections[call.callId]
-                connection?.setOnHold()
-
-                emitEvent(CallEventType.CALL_HELD, JSONObject().apply {
-                    put("callId", call.callId)
-                })
-
-                notifySpecificCallStateChanged(appContext!!, call.callId, CallState.HELD)
-                Log.d(TAG, "Call ${call.callId} held by system due to audio focus loss")
-            }
-        }
-
-        stopRingback()
-        updateForegroundNotification(appContext!!)
-    }
-
-    private fun handleAudioFocusGain() {
-        Log.d(TAG, "Audio focus regained - system call likely ended")
-        hasAudioFocus = true
-        isSystemCallActive = false
-
-        // Automatically resume calls that were held by system after a short delay
-        Handler(Looper.getMainLooper()).postDelayed({
-            activeCalls.values.filter { it.state == CallState.HELD && it.wasHeldBySystem }.forEach { call ->
-                Log.d(TAG, "Auto-resuming call ${call.callId} after system call ended")
-                call.wasHeldBySystem = false
-                call.state = CallState.ACTIVE
-
-                val connection = telecomConnections[call.callId]
-                connection?.setActive()
-
-                emitEvent(CallEventType.CALL_UNHELD, JSONObject().apply {
-                    put("callId", call.callId)
-                })
-
-                notifySpecificCallStateChanged(appContext!!, call.callId, CallState.ACTIVE)
-            }
-            updateForegroundNotification(appContext!!)
-        }, 1000) // 1 second delay to ensure system is ready
-    }
-
-    private fun requestAudioFocus(): Boolean {
-        audioManager = audioManager ?: appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (audioFocusRequest == null) {
-                audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                    .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                            .build()
-                    )
-                    .setOnAudioFocusChangeListener(audioFocusChangeListener)
-                    .build()
-            }
-            val result = audioManager?.requestAudioFocus(audioFocusRequest!!)
-            hasAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-            Log.d(TAG, "Audio focus request result: $result")
-            hasAudioFocus
-        } else {
-            @Suppress("DEPRECATION")
-            val result = audioManager?.requestAudioFocus(
-                audioFocusChangeListener,
-                AudioManager.STREAM_VOICE_CALL,
-                AudioManager.AUDIOFOCUS_GAIN
-            )
-            hasAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-            Log.d(TAG, "Audio focus request result (legacy): $result")
-            hasAudioFocus
-        }
-    }
-
-    private fun abandonAudioFocus() {
-        audioManager = audioManager ?: appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            audioFocusRequest?.let { request ->
-                audioManager?.abandonAudioFocusRequest(request)
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager?.abandonAudioFocus(audioFocusChangeListener)
-        }
-        hasAudioFocus = false
-        Log.d(TAG, "Audio focus abandoned")
+    private fun requireContext(): Context {
+        return appContext ?: throw IllegalStateException(
+            "CallEngine not initialized. Call initialize() in Application.onCreate()"
+        )
     }
 
     // --- Event System ---
@@ -229,12 +113,12 @@ object CallEngine {
     }
 
     fun emitEvent(type: CallEventType, data: JSONObject) {
-        Log.d(TAG, "Emitting event: $type, data: $data")
+        Log.d(TAG, "Emitting event: $type")
         val dataString = data.toString()
         if (eventHandler != null) {
             eventHandler?.invoke(type, dataString)
         } else {
-            Log.d(TAG, "No event handler registered, caching event: $type")
+            Log.d(TAG, "No event handler, caching event: $type")
             cachedEvents.add(Pair(type, dataString))
         }
     }
@@ -268,18 +152,16 @@ object CallEngine {
     // --- Telecom Connection Management ---
     fun addTelecomConnection(callId: String, connection: Connection) {
         telecomConnections[callId] = connection
-        Log.d(TAG, "Added Telecom Connection for callId: $callId. Total: ${telecomConnections.size}")
+        Log.d(TAG, "Added Telecom Connection for callId: $callId")
     }
 
     fun removeTelecomConnection(callId: String) {
         telecomConnections.remove(callId)?.let {
-            Log.d(TAG, "Removed Telecom Connection for callId: $callId. Total: ${telecomConnections.size}")
+            Log.d(TAG, "Removed Telecom Connection for callId: $callId")
         }
     }
 
     fun getTelecomConnection(callId: String): Connection? = telecomConnections[callId]
-
-    fun getAppContext(): Context? = appContext
 
     // --- Public API ---
     fun setCanMakeMultipleCalls(allow: Boolean) {
@@ -291,24 +173,29 @@ object CallEngine {
         val calls = getActiveCalls()
         val jsonArray = JSONArray()
         calls.forEach {
-            val obj = JSONObject()
-            obj.put("callId", it.callId)
-            obj.put("callData", it.callData)
-            obj.put("state", it.state.name)
-            obj.put("callType", it.callType)
-            jsonArray.put(obj)
+            jsonArray.put(it.toJsonObject())
         }
-        val result = jsonArray.toString()
-        Log.d(TAG, "Current call state: $result")
-        return result
+        return jsonArray.toString()
     }
 
     // --- Incoming Call Management ---
-    fun reportIncomingCall(context: Context, callId: String, callData: String) {
-        appContext = context.applicationContext
-        Log.d(TAG, "reportIncomingCall: $callId, $callData")
+    fun reportIncomingCall(
+        context: Context,
+        callId: String,
+        callType: String,
+        displayName: String,
+        pictureUrl: String? = null,
+        metadata: String? = null
+    ) {
+        if (!isInitialized.get()) {
+            initialize(context)
+        }
 
-        // Check for call collision - reject second incoming call automatically
+        Log.d(TAG, "reportIncomingCall: callId=$callId, type=$callType, name=$displayName")
+
+        metadata?.let { callMetadata[callId] = it }
+
+        // Check for call collision
         val incomingCall = activeCalls.values.find { it.state == CallState.INCOMING }
         if (incomingCall != null && incomingCall.callId != callId) {
             Log.d(TAG, "Incoming call collision detected. Auto-rejecting new call: $callId")
@@ -316,7 +203,6 @@ object CallEngine {
             return
         }
 
-        // Check if there's an active call when receiving incoming
         val activeCall = activeCalls.values.find { it.state == CallState.ACTIVE || it.state == CallState.HELD }
         if (activeCall != null && !canMakeMultipleCalls) {
             Log.d(TAG, "Active call exists when receiving incoming call. Auto-rejecting: $callId")
@@ -324,55 +210,57 @@ object CallEngine {
             return
         }
 
-        val callerName = extractCallerName(callData)
-        val parsedCallType = extractCallType(callData)
-        val isVideoCallBoolean = parsedCallType == "Video"
+        val isVideoCall = callType == "Video"
 
         if (!canMakeMultipleCalls && activeCalls.isNotEmpty()) {
-            Log.d(TAG, "Can't make multiple calls, holding existing calls.")
             activeCalls.values.forEach {
                 if (it.state == CallState.ACTIVE) {
-                    it.state = CallState.HELD
+                    holdCallInternal(it.callId, heldBySystem = false)
                 }
             }
         }
 
-        activeCalls[callId] = CallInfo(callId, callData, CallState.INCOMING, parsedCallType)
+        activeCalls[callId] = CallInfo(callId, callType, displayName, pictureUrl, CallState.INCOMING)
         currentCallId = callId
-        Log.d(TAG, "Call $callId added to activeCalls. State: INCOMING, callType: $parsedCallType")
+        Log.d(TAG, "Call $callId added to activeCalls. State: INCOMING")
 
-        showIncomingCallUI(context, callId, callerName, parsedCallType)
-        registerPhoneAccount(context)
+        showIncomingCallUI(callId, displayName, callType)
+        registerPhoneAccount()
 
-        val telecomManager = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-        val phoneAccountHandle = getPhoneAccountHandle(context)
+        val telecomManager = requireContext().getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+        val phoneAccountHandle = getPhoneAccountHandle()
         val extras = Bundle().apply {
-            putString(MyConnectionService.EXTRA_CALL_DATA, callData)
-            putBoolean(MyConnectionService.EXTRA_IS_VIDEO_CALL_BOOLEAN, isVideoCallBoolean)
+            putString(MyConnectionService.EXTRA_CALL_ID, callId)
+            putString(MyConnectionService.EXTRA_CALL_TYPE, callType)
+            putString(MyConnectionService.EXTRA_DISPLAY_NAME, displayName)
+            putBoolean(MyConnectionService.EXTRA_IS_VIDEO_CALL_BOOLEAN, isVideoCall)
+            pictureUrl?.let { putString(MyConnectionService.EXTRA_PICTURE_URL, it) }
         }
 
         try {
             telecomManager.addNewIncomingCall(phoneAccountHandle, extras)
-            startForegroundService(context)
+            startForegroundService()
             Log.d(TAG, "Successfully reported incoming call to TelecomManager for $callId")
-        } catch (e: SecurityException) {
-            Log.e(TAG, "SecurityException: Failed to report incoming call. Check MANAGE_OWN_CALLS permission: ${e.message}", e)
-            endCall(context, callId)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to report incoming call: ${e.message}", e)
-            endCall(context, callId)
+            endCallInternal(callId)
         }
 
         updateLockScreenBypass()
-        notifySpecificCallStateChanged(context, callId, CallState.INCOMING)
     }
 
     // --- Outgoing Call Management ---
-    fun startOutgoingCall(context: Context, callId: String, callData: String) {
-        appContext = context.applicationContext
-        Log.d(TAG, "startOutgoingCall: $callId, $callData")
+    fun startOutgoingCall(
+        callId: String,
+        callType: String,
+        targetName: String,
+        metadata: String? = null
+    ) {
+        val context = requireContext()
+        Log.d(TAG, "startOutgoingCall: callId=$callId, type=$callType, target=$targetName")
 
-        // Validate outgoing call request
+        metadata?.let { callMetadata[callId] = it }
+
         if (!validateOutgoingCallRequest()) {
             Log.w(TAG, "Rejecting outgoing call - incoming/active call exists")
             emitEvent(CallEventType.CALL_REJECTED, JSONObject().apply {
@@ -382,71 +270,114 @@ object CallEngine {
             return
         }
 
-        val targetName = extractCallerName(callData)
-        val parsedCallType = extractCallType(callData)
-        val isVideoCallBoolean = parsedCallType == "Video"
-
+        val isVideoCall = callType == "Video"
         if (!canMakeMultipleCalls && activeCalls.isNotEmpty()) {
-            Log.d(TAG, "Can't make multiple calls, holding existing calls before outgoing.")
             activeCalls.values.forEach {
                 if (it.state == CallState.ACTIVE) {
-                    it.state = CallState.HELD
+                    holdCallInternal(it.callId, heldBySystem = false)
                 }
             }
         }
 
-        activeCalls[callId] = CallInfo(callId, callData, CallState.DIALING, parsedCallType)
+        // Track dialing state
+        activeCalls[callId] = CallInfo(callId, callType, targetName, null, CallState.DIALING)
         currentCallId = callId
-        Log.d(TAG, "Call $callId added to activeCalls. State: DIALING, callType: $parsedCallType")
+        Log.d(TAG, "Call $callId added to activeCalls. State: DIALING")
 
-        registerPhoneAccount(context)
+        // ONLY set audio mode - let system handle audio focus for self-managed calls
+        setAudioMode()
+
+        registerPhoneAccount()
         val telecomManager = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-        val phoneAccountHandle = getPhoneAccountHandle(context)
-        val addressUri = Uri.fromParts(PhoneAccount.SCHEME_TEL, callId, null)
+        val phoneAccountHandle = getPhoneAccountHandle()
+        val addressUri = Uri.fromParts(PhoneAccount.SCHEME_TEL, targetName, null)
+
+        val outgoingExtras = Bundle().apply {
+            putString(MyConnectionService.EXTRA_CALL_ID, callId)
+            putString(MyConnectionService.EXTRA_CALL_TYPE, callType)
+            putString(MyConnectionService.EXTRA_DISPLAY_NAME, targetName)
+            putBoolean(MyConnectionService.EXTRA_IS_VIDEO_CALL_BOOLEAN, isVideoCall)
+            metadata?.let { putString("metadata", it) }
+        }
 
         val extras = Bundle().apply {
             putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, phoneAccountHandle)
-            putString(MyConnectionService.EXTRA_CALL_DATA, callData)
-            putBoolean(MyConnectionService.EXTRA_IS_VIDEO_CALL_BOOLEAN, isVideoCallBoolean)
-            putBoolean(TelecomManager.EXTRA_START_CALL_WITH_SPEAKERPHONE, isVideoCallBoolean)
+            putBundle(TelecomManager.EXTRA_OUTGOING_CALL_EXTRAS, outgoingExtras)
+            putBoolean(TelecomManager.EXTRA_START_CALL_WITH_SPEAKERPHONE, isVideoCall)
         }
 
         try {
             telecomManager.placeCall(addressUri, extras)
-            startForegroundService(context)
-            Log.d(TAG, "Successfully reported outgoing call to TelecomManager via placeCall for $callId")
+            startForegroundService()
 
-            // Request audio focus and start ringback
-            requestAudioFocus()
+            // Start ringback (system will handle audio focus)
             startRingback()
 
-            bringAppToForeground(context)
-            keepScreenAwake(context, true)
-            setInitialAudioRoute(context, parsedCallType)
-        } catch (e: SecurityException) {
-            Log.e(TAG, "SecurityException: Failed to start outgoing call via placeCall. Check MANAGE_OWN_CALLS permission: ${e.message}", e)
-            endCall(context, callId)
+            bringAppToForeground()
+            keepScreenAwake(true)
+            setInitialAudioRoute(callType)
+            Log.d(TAG, "Successfully reported outgoing call to TelecomManager")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start outgoing call via placeCall: ${e.message}", e)
-            endCall(context, callId)
+            Log.e(TAG, "Failed to start outgoing call: ${e.message}", e)
+            endCallInternal(callId)
         }
 
         updateLockScreenBypass()
-        notifySpecificCallStateChanged(context, callId, CallState.DIALING)
     }
 
-    // --- Call Answer Management ---
-    fun callAnsweredFromJS(context: Context, callId: String) {
+    fun startCall(
+        callId: String,
+        callType: String,
+        targetName: String,
+        metadata: String? = null
+    ) {
+        Log.d(TAG, "startCall: callId=$callId, type=$callType, target=$targetName")
+
+        metadata?.let { callMetadata[callId] = it }
+
+        if (activeCalls.containsKey(callId)) {
+            Log.w(TAG, "Call $callId already exists, cannot start again")
+            return
+        }
+
+        if (!canMakeMultipleCalls && activeCalls.isNotEmpty()) {
+            activeCalls.values.forEach {
+                if (it.state == CallState.ACTIVE) {
+                    holdCallInternal(it.callId, heldBySystem = false)
+                }
+            }
+        }
+
+        // Start directly as active call
+        activeCalls[callId] = CallInfo(callId, callType, targetName, null, CallState.ACTIVE)
+        currentCallId = callId
+        Log.d(TAG, "Call $callId started as ACTIVE")
+
+        registerPhoneAccount()
+        setAudioMode()
+        bringAppToForeground()
+        startForegroundService()
+        keepScreenAwake(true)
+        setInitialAudioRoute(callType)
+        updateLockScreenBypass()
+
+        // Emit outgoing call answered event
+        emitOutgoingCallAnsweredWithMetadata(callId)
+    }
+
+    // --- Call Answer Management (SIMPLIFIED - NO MANUAL AUDIO FOCUS) ---
+    fun callAnsweredFromJS(callId: String) {
         Log.d(TAG, "callAnsweredFromJS: $callId - remote party answered")
-        coreCallAnswered(context, callId, isLocalAnswer = false)
+        coreCallAnswered(callId, isLocalAnswer = false)
     }
 
-    fun answerCall(context: Context, callId: String) {
+    fun answerCall(callId: String) {
         Log.d(TAG, "answerCall: $callId - local party answering")
-        coreCallAnswered(context, callId, isLocalAnswer = true)
+        coreCallAnswered(callId, isLocalAnswer = true)
     }
 
-    private fun coreCallAnswered(context: Context, callId: String, isLocalAnswer: Boolean) {
+    // SIMPLIFIED: Let system handle audio focus for self-managed calls
+    private fun coreCallAnswered(callId: String, isLocalAnswer: Boolean) {
         Log.d(TAG, "coreCallAnswered: $callId, isLocalAnswer: $isLocalAnswer")
 
         val callInfo = activeCalls[callId]
@@ -455,204 +386,263 @@ object CallEngine {
             return
         }
 
-        // Stop all ringtones and notifications immediately
+        // Set audio mode and let system handle audio focus
+        setAudioMode()
+
+        // Set call to ACTIVE
+        activeCalls[callId] = callInfo.copy(state = CallState.ACTIVE)
+        currentCallId = callId
+        Log.d(TAG, "Call $callId set to ACTIVE state (system manages audio focus)")
+
+        // Clean up media and UI
         stopRingtone()
         stopRingback()
-        cancelIncomingCallUI(context)
+        cancelIncomingCallUI()
 
-        // Request audio focus when answering
-        requestAudioFocus()
-
-        // Update call state
-        activeCalls[callId]?.state = CallState.ACTIVE
-        currentCallId = callId
-
+        // Handle multiple calls
         if (!canMakeMultipleCalls) {
-            activeCalls.filter { it.key != callId }.values.forEach {
-                if (it.state == CallState.ACTIVE) {
-                    it.state = CallState.HELD
+            activeCalls.filter { it.key != callId }.values.forEach { otherCall ->
+                if (otherCall.state == CallState.ACTIVE) {
+                    holdCallInternal(otherCall.callId, heldBySystem = false)
                 }
             }
         }
 
-        // Bring app to foreground when call is answered
-        bringAppToForeground(context)
-        startForegroundService(context)
-        keepScreenAwake(context, true)
-        resetAudioMode(context)
-
+        bringAppToForeground()
+        startForegroundService()
+        keepScreenAwake(true)
         updateLockScreenBypass()
 
-        // Update foreground notification with call info
-        updateForegroundNotification(context)
+        // Emit events based on call direction
+        if (isLocalAnswer) {
+            emitCallAnsweredWithMetadata(callId)
+        } else {
+            emitOutgoingCallAnsweredWithMetadata(callId)
+        }
 
-        // Emit event with full call data instead of just callId
+        Log.d(TAG, "Call $callId successfully answered")
+    }
+
+    // For incoming calls (local answer)
+    private fun emitCallAnsweredWithMetadata(callId: String) {
+        val callInfo = activeCalls[callId] ?: return
+        val metadata = callMetadata[callId]
+
         emitEvent(CallEventType.CALL_ANSWERED, JSONObject().apply {
             put("callId", callId)
-            put("callData", callInfo.callData)
             put("callType", callInfo.callType)
+            put("displayName", callInfo.displayName)
+            callInfo.pictureUrl?.let { put("pictureUrl", it) }
+            metadata?.let {
+                try {
+                    put("metadata", JSONObject(it))
+                } catch (e: Exception) {
+                    put("metadata", it)
+                }
+            }
         })
+    }
 
-        notifySpecificCallStateChanged(context, callId, CallState.ACTIVE)
-        Log.d(TAG, "Call $callId successfully answered and UI cleaned up")
+    // For outgoing calls (remote answer)
+    private fun emitOutgoingCallAnsweredWithMetadata(callId: String) {
+        val callInfo = activeCalls[callId] ?: return
+        val metadata = callMetadata[callId]
+
+        emitEvent(CallEventType.OUTGOING_CALL_ANSWERED, JSONObject().apply {
+            put("callId", callId)
+            put("callType", callInfo.callType)
+            put("displayName", callInfo.displayName)
+            callInfo.pictureUrl?.let { put("pictureUrl", it) }
+            metadata?.let {
+                try {
+                    put("metadata", JSONObject(it))
+                } catch (e: Exception) {
+                    put("metadata", it)
+                }
+            }
+        })
     }
 
     // --- Call Control Methods ---
-    fun holdCall(context: Context, callId: String) {
-        Log.d(TAG, "holdCall: $callId")
+    fun holdCall(callId: String) {
+        holdCallInternal(callId, heldBySystem = false)
+    }
+
+    fun setOnHold(callId: String, onHold: Boolean) {
+        Log.d(TAG, "setOnHold: $callId, onHold: $onHold")
+        val callInfo = activeCalls[callId]
+        if (callInfo == null) {
+            Log.w(TAG, "Cannot set hold state for call $callId - not found")
+            return
+        }
+
+        if (onHold && callInfo.state == CallState.ACTIVE) {
+            holdCallInternal(callId, heldBySystem = false)
+        } else if (!onHold && callInfo.state == CallState.HELD) {
+            unholdCallInternal(callId, resumedBySystem = false)
+        }
+    }
+
+    private fun holdCallInternal(callId: String, heldBySystem: Boolean) {
+        Log.d(TAG, "holdCallInternal: $callId, heldBySystem: $heldBySystem")
         val callInfo = activeCalls[callId]
         if (callInfo?.state != CallState.ACTIVE) {
-            Log.w(TAG, "Cannot hold call $callId - not in active state (current: ${callInfo?.state})")
+            Log.w(TAG, "Cannot hold call $callId - not in active state")
             return
         }
 
-        activeCalls[callId]?.state = CallState.HELD
-        val connection = telecomConnections[callId]
-        connection?.setOnHold()
+        activeCalls[callId] = callInfo.copy(
+            state = CallState.HELD,
+            wasHeldBySystem = heldBySystem
+        )
 
-        updateForegroundNotification(context)
+        telecomConnections[callId]?.setOnHold()
+        updateForegroundNotification()
         emitEvent(CallEventType.CALL_HELD, JSONObject().put("callId", callId))
         updateLockScreenBypass()
-        notifySpecificCallStateChanged(context, callId, CallState.HELD)
     }
 
-    fun unholdCall(context: Context, callId: String) {
-        Log.d(TAG, "unholdCall: $callId")
+    fun unholdCall(callId: String) {
+        unholdCallInternal(callId, resumedBySystem = false)
+    }
+
+    private fun unholdCallInternal(callId: String, resumedBySystem: Boolean) {
+        Log.d(TAG, "unholdCallInternal: $callId, resumedBySystem: $resumedBySystem")
         val callInfo = activeCalls[callId]
         if (callInfo?.state != CallState.HELD) {
-            Log.w(TAG, "Cannot unhold call $callId - not in held state (current: ${callInfo?.state})")
+            Log.w(TAG, "Cannot unhold call $callId - not in held state")
             return
         }
 
-        // Try to request audio focus, but don't fail if we can't get it immediately
-        // The system will handle audio routing properly
-        if (!hasAudioFocus) {
-            Log.d(TAG, "Attempting to request audio focus for unhold")
-            requestAudioFocus()
-        }
+        activeCalls[callId] = callInfo.copy(
+            state = CallState.ACTIVE,
+            wasHeldBySystem = false
+        )
 
-        activeCalls[callId]?.state = CallState.ACTIVE
-        activeCalls[callId]?.wasHeldBySystem = false
-        val connection = telecomConnections[callId]
-        connection?.setActive()
-
-        updateForegroundNotification(context)
+        telecomConnections[callId]?.setActive()
+        updateForegroundNotification()
         emitEvent(CallEventType.CALL_UNHELD, JSONObject().put("callId", callId))
         updateLockScreenBypass()
-        notifySpecificCallStateChanged(context, callId, CallState.ACTIVE)
-
-        Log.d(TAG, "Call $callId successfully unheld")
     }
 
-    fun muteCall(context: Context, callId: String) {
-        Log.d(TAG, "muteCall: $callId")
-        audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    fun muteCall(callId: String) {
+        setMutedInternal(callId, true)
+    }
 
-        // Only emit event if mute state actually changes
-        val wasMuted = audioManager?.isMicrophoneMute ?: false
-        audioManager?.isMicrophoneMute = true
+    fun unmuteCall(callId: String) {
+        setMutedInternal(callId, false)
+    }
 
-        if (!wasMuted) {
-            lastMuteState = true
-            emitEvent(CallEventType.CALL_MUTED, JSONObject().put("callId", callId))
+    fun setMuted(callId: String, muted: Boolean) {
+        setMutedInternal(callId, muted)
+    }
+
+    private fun setMutedInternal(callId: String, muted: Boolean) {
+        val callInfo = activeCalls[callId]
+        if (callInfo == null) {
+            Log.w(TAG, "Cannot set mute state for call $callId - not found")
+            return
         }
-    }
 
-    fun unmuteCall(context: Context, callId: String) {
-        Log.d(TAG, "unmuteCall: $callId")
+        val context = requireContext()
         audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-        // Only emit event if mute state actually changes
         val wasMuted = audioManager?.isMicrophoneMute ?: false
-        audioManager?.isMicrophoneMute = false
+        audioManager?.isMicrophoneMute = muted
 
-        if (wasMuted) {
-            lastMuteState = false
-            emitEvent(CallEventType.CALL_UNMUTED, JSONObject().put("callId", callId))
+        if (wasMuted != muted) {
+            val eventType = if (muted) CallEventType.CALL_MUTED else CallEventType.CALL_UNMUTED
+            emitEvent(eventType, JSONObject().put("callId", callId))
+            Log.d(TAG, "Call $callId mute state changed to: $muted")
         }
     }
 
     // --- Call End Management ---
-    fun endCall(context: Context, callId: String) {
-        appContext = context.applicationContext
+    fun endCall(callId: String) {
         Log.d(TAG, "endCall: $callId")
-        coreEndCall(context, callId)
+        endCallInternal(callId)
     }
 
-    fun endAllCalls(context: Context) {
-        Log.d(TAG, "endAllCalls: Ending all active calls.")
-        if (activeCalls.isEmpty()) {
-            Log.d(TAG, "No active calls, nothing to do.")
-            return
-        }
+    fun endAllCalls() {
+        Log.d(TAG, "endAllCalls: Ending all active calls")
+        if (activeCalls.isEmpty()) return
 
         activeCalls.keys.toList().forEach { callId ->
-            coreEndCall(context, callId)
+            endCallInternal(callId)
         }
 
         activeCalls.clear()
         telecomConnections.clear()
+        callMetadata.clear()
         currentCallId = null
 
-        finalCleanup(context)
+        cleanup()
         updateLockScreenBypass()
     }
 
-    private fun coreEndCall(context: Context, callId: String) {
-        Log.d(TAG, "coreEndCall: $callId")
+    private fun endCallInternal(callId: String) {
+        Log.d(TAG, "endCallInternal: $callId")
 
         val callInfo = activeCalls[callId] ?: run {
             Log.w(TAG, "Call $callId not found in active calls")
             return
         }
 
-        // Update call state
-        activeCalls[callId]?.state = CallState.ENDED
-        activeCalls.remove(callId)
-        Log.d(TAG, "Call $callId removed from activeCalls. Remaining: ${activeCalls.size}")
+        val metadata = callMetadata.remove(callId)
 
-        // Stop ringtones and notifications
+        activeCalls[callId] = callInfo.copy(state = CallState.ENDED)
+        activeCalls.remove(callId)
+
         stopRingback()
         stopRingtone()
-        cancelIncomingCallUI(context)
+        cancelIncomingCallUI()
 
-        // Update current call
         if (currentCallId == callId) {
             currentCallId = activeCalls.filter { it.value.state != CallState.ENDED }.keys.firstOrNull()
-            Log.d(TAG, "Current call was $callId. New currentCallId: $currentCallId")
         }
 
-        // Handle telecom connection
         val connection = telecomConnections[callId]
         if (connection != null) {
             connection.setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
             connection.destroy()
             removeTelecomConnection(callId)
-            Log.d(TAG, "Telecom Connection for $callId disconnected and destroyed.")
         }
 
-        // If no more calls, do final cleanup
         if (activeCalls.isEmpty()) {
-            finalCleanup(context)
+            cleanup()
         } else {
-            updateForegroundNotification(context)
+            updateForegroundNotification()
         }
 
         updateLockScreenBypass()
-        emitEvent(CallEventType.CALL_ENDED, JSONObject().put("callId", callId))
-        notifySpecificCallStateChanged(context, callId, CallState.ENDED)
+
+        // Emit end event with metadata
+        emitEvent(CallEventType.CALL_ENDED, JSONObject().apply {
+            put("callId", callId)
+            metadata?.let {
+                try {
+                    put("metadata", JSONObject(it))
+                } catch (e: Exception) {
+                    put("metadata", it)
+                }
+            }
+        })
     }
 
-    // --- Audio Management ---
+    // --- Enhanced Audio Management ---
     fun getAudioDevices(): AudioRoutesInfo {
-        audioManager = appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: run {
-            Log.e(TAG, "getAudioDevices: AudioManager is null or appContext is not set. Returning default.")
+        val context = requireContext()
+        audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: run {
             return AudioRoutesInfo(emptyArray(), "Unknown")
         }
 
         val devices = mutableSetOf<String>()
-        var currentRoute = "Earpiece" // Default
 
+        // ALWAYS include Speaker and Earpiece for phone calls
+        devices.add("Speaker")
+        devices.add("Earpiece")
+
+        // Check for additional connected devices
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val audioDeviceInfoList = audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
             audioDeviceInfoList?.forEach { device ->
@@ -663,34 +653,34 @@ object CallEngine {
                     AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_WIRED_HEADSET -> {
                         devices.add("Headset")
                     }
-                    AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> {
-                        devices.add("Speaker")
-                    }
-                    AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> {
-                        devices.add("Earpiece")
-                    }
+                    // Speaker and Earpiece already added above if they are reported, but explicit add handles cases where they are not
                 }
             }
         } else {
-            devices.addAll(listOf("Speaker", "Earpiece"))
+            // For older versions, check for Bluetooth and Headset
+            @Suppress("DEPRECATION")
+            if (audioManager?.isBluetoothA2dpOn == true || audioManager?.isBluetoothScoOn == true) {
+                devices.add("Bluetooth")
+            }
+            @Suppress("DEPRECATION")
+            if (audioManager?.isWiredHeadsetOn == true) {
+                devices.add("Headset")
+            }
         }
 
-        // Determine current route
-        currentRoute = when {
-            audioManager?.isBluetoothScoOn == true -> "Bluetooth"
-            audioManager?.isSpeakerphoneOn == true -> "Speaker"
-            audioManager?.isWiredHeadsetOn == true -> "Headset"
-            else -> "Earpiece"
-        }
+        val currentRoute = getCurrentAudioRoute()
+        Log.d(TAG, "Available audio devices: ${devices.toList()}, current route: $currentRoute")
 
-        val result = AudioRoutesInfo(devices.toTypedArray(), currentRoute)
-        Log.d(TAG, "Audio devices info: $result")
-        return result
+        // Update last known audio routes info
+        lastAudioRoutesInfo = AudioRoutesInfo(devices.toTypedArray(), currentRoute)
+
+        return AudioRoutesInfo(devices.toTypedArray(), currentRoute)
     }
 
-    fun setAudioRoute(context: Context, route: String) {
+    fun setAudioRoute(route: String) {
+        val context = requireContext()
         audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        Log.d(TAG, "Attempting to set audio route to: $route. Current mode: ${audioManager?.mode}")
+        Log.d(TAG, "Setting audio route to: $route")
 
         val previousRoute = getCurrentAudioRoute()
 
@@ -701,34 +691,32 @@ object CallEngine {
 
         when (route) {
             "Speaker" -> {
-                Log.d(TAG, "Setting audio route to Speaker.")
                 audioManager?.isSpeakerphoneOn = true
                 audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
             }
             "Earpiece" -> {
-                Log.d(TAG, "Setting audio route to Earpiece.")
                 audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
+                // Earpiece is the default - just ensure speaker and bluetooth are off
             }
             "Bluetooth" -> {
-                Log.d(TAG, "Setting audio route to Bluetooth.")
                 audioManager?.startBluetoothSco()
                 audioManager?.isBluetoothScoOn = true
                 audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
             }
             "Headset" -> {
-                Log.d(TAG, "Setting audio route to Headset (wired).")
                 audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
+                // Headset routing is automatic when connected
             }
             else -> {
-                Log.w(TAG, "Unknown audio route: $route. No action taken.")
+                Log.w(TAG, "Unknown audio route: $route")
                 return
             }
         }
 
-        // Only emit event if route actually changed
         val newRoute = getCurrentAudioRoute()
         if (previousRoute != newRoute) {
-            emitEvent(CallEventType.AUDIO_ROUTE_CHANGED, JSONObject().put("route", newRoute))
+            // Emit unified event with full context
+            emitAudioRouteChanged()
         }
     }
 
@@ -741,85 +729,88 @@ object CallEngine {
         }
     }
 
-    private fun setInitialAudioRoute(context: Context, callType: String) {
-        // Get available audio devices to determine priority
-        val availableDevices = getAudioDevices()
+    private fun setInitialAudioRoute(callType: String) {
+        val availableDevices = getAudioDevices() // This will update lastAudioRoutesInfo
 
         val defaultRoute = when {
-            // Prioritize Bluetooth if available (latest connected device)
             availableDevices.devices.contains("Bluetooth") -> "Bluetooth"
-            // Then wired headset
             availableDevices.devices.contains("Headset") -> "Headset"
-            // For video calls, default to speaker if no priority device
             callType == "Video" -> "Speaker"
-            // For audio calls, default to earpiece if no priority device
             else -> "Earpiece"
         }
 
-        Log.d(TAG, "Setting initial audio route for $callType call: $defaultRoute")
-        setAudioRoute(context, defaultRoute)
+        Log.d(TAG, "Setting initial audio route: $defaultRoute")
+        setAudioRoute(defaultRoute)
     }
 
-    fun resetAudioMode(context: Context) {
-        audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private fun setAudioMode() {
+        audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
+        Log.d(TAG, "Audio mode set to MODE_IN_COMMUNICATION (system handles audio focus)")
+    }
+
+    private fun resetAudioMode() {
         if (activeCalls.isEmpty()) {
-            Log.d(TAG, "Resetting audio mode to NORMAL as no active calls remain.")
             audioManager?.mode = AudioManager.MODE_NORMAL
             audioManager?.stopBluetoothSco()
             audioManager?.isBluetoothScoOn = false
             audioManager?.isSpeakerphoneOn = false
-            abandonAudioFocus()
-        } else {
-            Log.d(TAG, "Audio mode not reset; ${activeCalls.size} calls still active.")
+            Log.d(TAG, "Audio mode reset to MODE_NORMAL")
         }
+    }
+
+    // UNIFIED event emission - always sends full audio context
+    private fun emitAudioRouteChanged() {
+        // Re-calculate latest state to ensure accuracy
+        val audioInfo = getAudioDevices() // This updates lastAudioRoutesInfo internally
+        val jsonPayload = JSONObject().apply {
+            put("devices", JSONArray(audioInfo.devices.toList()))
+            put("currentRoute", audioInfo.currentRoute)
+        }
+        emitEvent(CallEventType.AUDIO_ROUTE_CHANGED, jsonPayload)
+        Log.d(TAG, "Audio route changed: ${audioInfo.currentRoute}, available: ${audioInfo.devices.toList()}")
     }
 
     // --- Audio Device Callback ---
     private val audioDeviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
-            Log.d(TAG, "Audio devices added. Checking for changes.")
-            emitAudioDevicesChangedIfNeeded()
+            Log.d(TAG, "Audio devices added")
+            emitAudioDevicesChanged()
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
-            Log.d(TAG, "Audio devices removed. Checking for changes.")
-            emitAudioDevicesChangedIfNeeded()
+            Log.d(TAG, "Audio devices removed")
+            emitAudioDevicesChanged()
         }
     }
 
-    fun registerAudioDeviceCallback(context: Context) {
-        appContext = context.applicationContext
+    // Event for when physical devices are added/removed - includes full audio context
+    private fun emitAudioDevicesChanged() {
+        // Re-calculate latest state to ensure accuracy
+        val audioInfo = getAudioDevices() // This updates lastAudioRoutesInfo internally
+        val jsonPayload = JSONObject().apply {
+            put("devices", JSONArray(audioInfo.devices.toList()))
+            put("currentRoute", audioInfo.currentRoute)
+        }
+        emitEvent(CallEventType.AUDIO_DEVICES_CHANGED, jsonPayload)
+        Log.d(TAG, "Audio devices changed: available: ${audioInfo.devices.toList()}")
+    }
+
+
+    fun registerAudioDeviceCallback() {
+        val context = requireContext()
         audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         audioManager?.registerAudioDeviceCallback(audioDeviceCallback, null)
-        Log.d(TAG, "Audio device callback registered.")
     }
 
-    fun unregisterAudioDeviceCallback(context: Context) {
+    fun unregisterAudioDeviceCallback() {
+        val context = requireContext()
         audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         audioManager?.unregisterAudioDeviceCallback(audioDeviceCallback)
-        Log.d(TAG, "Audio device callback unregistered.")
-    }
-
-    private fun emitAudioDevicesChangedIfNeeded() {
-        val context = appContext ?: return
-        val currentAudioInfo = getAudioDevices()
-
-        // Only emit if something actually changed
-        if (lastAudioRoutesInfo == null ||
-            !currentAudioInfo.devices.contentEquals(lastAudioRoutesInfo!!.devices) ||
-            currentAudioInfo.currentRoute != lastAudioRoutesInfo!!.currentRoute) {
-
-            lastAudioRoutesInfo = currentAudioInfo
-            val jsonPayload = JSONObject().apply {
-                put("devices", JSONArray(currentAudioInfo.devices.toList()))
-                put("currentRoute", currentAudioInfo.currentRoute)
-            }
-            emitEvent(CallEventType.AUDIO_DEVICES_CHANGED, jsonPayload)
-        }
     }
 
     // --- Screen Management ---
-    fun keepScreenAwake(context: Context, keepAwake: Boolean) {
+    fun keepScreenAwake(keepAwake: Boolean) {
+        val context = requireContext()
         val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
         if (keepAwake) {
             if (wakeLock == null || !wakeLock!!.isHeld) {
@@ -827,14 +818,14 @@ object CallEngine {
                     PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
                     "CallEngine:WakeLock"
                 )
-                wakeLock?.acquire(10 * 60 * 1000L /* 10 minutes */)
-                Log.d(TAG, "Acquired SCREEN_DIM_WAKE_LOCK.")
+                wakeLock?.acquire(10 * 60 * 1000L)
+                Log.d(TAG, "Acquired SCREEN_DIM_WAKE_LOCK")
             }
         } else {
             wakeLock?.let {
                 if (it.isHeld) {
                     it.release()
-                    Log.d(TAG, "Released SCREEN_DIM_WAKE_LOCK.")
+                    Log.d(TAG, "Released SCREEN_DIM_WAKE_LOCK")
                 }
             }
             wakeLock = null
@@ -857,34 +848,8 @@ object CallEngine {
         }
     }
 
-    private fun extractCallerName(callData: String): String {
-        return try {
-            JSONObject(callData).optString("name", "Unknown")
-        } catch (e: Exception) {
-            "Unknown"
-        }
-    }
-
-    private fun extractCallType(callData: String): String {
-        return try {
-            JSONObject(callData).optString("callType", "Audio")
-        } catch (e: Exception) {
-            "Audio"
-        }
-    }
-
     private fun rejectIncomingCallCollision(callId: String, reason: String) {
-        // Provide space for server HTTP request
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                // TODO: Add your server HTTP request here
-                Log.d(TAG, "Server rejection request would be made here for callId: $callId, reason: $reason")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to send rejection to server", e)
-            }
-        }
-
-        // Emit rejection event
+        callMetadata.remove(callId)
         emitEvent(CallEventType.CALL_REJECTED, JSONObject().apply {
             put("callId", callId)
             put("reason", reason)
@@ -892,7 +857,8 @@ object CallEngine {
     }
 
     // --- Notification Management ---
-    private fun createNotificationChannel(context: Context) {
+    private fun createNotificationChannel() {
+        val context = requireContext()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 NOTIF_CHANNEL_ID,
@@ -919,13 +885,13 @@ object CallEngine {
 
             val manager = context.getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
-            Log.d(TAG, "Notification channel '$NOTIF_CHANNEL_ID' created/updated.")
         }
     }
 
-    fun showIncomingCallUI(context: Context, callId: String, callerName: String, callType: String) {
-        Log.d(TAG, "Showing incoming call UI for $callId, caller: $callerName, callType: $callType")
-        createNotificationChannel(context)
+    private fun showIncomingCallUI(callId: String, callerName: String, callType: String) {
+        val context = requireContext()
+        Log.d(TAG, "Showing incoming call UI for $callId")
+        createNotificationChannel()
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
         val answerIntent = Intent(context, CallNotificationActionReceiver::class.java).apply {
@@ -984,36 +950,33 @@ object CallEngine {
         notificationManager.notify(NOTIF_ID, notification)
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-            playRingtone(context)
+            playRingtone()
         }
 
-        setInitialAudioRoute(context, callType)
+        setInitialAudioRoute(callType)
     }
 
-    fun cancelIncomingCallUI(context: Context) {
-        Log.d(TAG, "Cancelling incoming call UI.")
+    fun cancelIncomingCallUI() {
+        val context = requireContext()
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         notificationManager.cancel(NOTIF_ID)
         stopRingtone()
     }
 
     // --- Service Management ---
-    fun startForegroundService(context: Context) {
-        Log.d(TAG, "Starting CallForegroundService.")
-
-        // Find the current active call to pass its info
+    private fun startForegroundService() {
+        val context = requireContext()
         val currentCall = activeCalls.values.find {
             it.state == CallState.ACTIVE || it.state == CallState.INCOMING ||
             it.state == CallState.DIALING || it.state == CallState.HELD
         }
 
         val intent = Intent(context, CallForegroundService::class.java)
-
         if (currentCall != null) {
             intent.putExtra("callId", currentCall.callId)
-            intent.putExtra("callData", currentCall.callData)
+            intent.putExtra("callType", currentCall.callType)
+            intent.putExtra("displayName", currentCall.displayName)
             intent.putExtra("state", currentCall.state.name)
-            Log.d(TAG, "Starting foreground service with call info: ${currentCall.callId}")
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -1023,24 +986,52 @@ object CallEngine {
         }
     }
 
-    fun stopForegroundService(context: Context) {
-        Log.d(TAG, "Stopping CallForegroundService.")
+    private fun stopForegroundService() {
+        val context = requireContext()
         val intent = Intent(context, CallForegroundService::class.java)
         context.stopService(intent)
     }
 
-    fun bringAppToForeground(context: Context) {
+    private fun updateForegroundNotification() {
+        startForegroundService() // Just restart the service with updated info
+    }
+
+    private fun isMainActivityInForeground(): Boolean {
+        val context = requireContext()
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val tasks = activityManager.getAppTasks()
+            if (tasks.isNotEmpty()) {
+                val taskInfo = tasks[0].taskInfo
+                return taskInfo.topActivity?.className?.contains("MainActivity") == true
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            val tasks = activityManager.getRunningTasks(1)
+            if (tasks.isNotEmpty()) {
+                return tasks[0].topActivity?.className?.contains("MainActivity") == true
+            }
+        }
+        return false
+    }
+
+    private fun bringAppToForeground() {
+        // Check if MainActivity is already in foreground
+        if (isMainActivityInForeground()) {
+            Log.d(TAG, "MainActivity is already in foreground, skipping bringAppToForeground()")
+            return
+        }
+
+        Log.d(TAG, "MainActivity is not in foreground, bringing to foreground")
+
+        val context = requireContext()
         val packageName = context.packageName
         val launchIntent = context.packageManager.getLaunchIntentForPackage(packageName)
         launchIntent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
 
         if (isCallActive()) {
             launchIntent?.putExtra("BYPASS_LOCK_SCREEN", true)
-            launchIntent?.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-            Log.d(TAG, "App brought to foreground with lock screen bypass request for active call")
-        } else {
-            launchIntent?.removeExtra("BYPASS_LOCK_SCREEN")
-            Log.d(TAG, "App brought to foreground without lock screen bypass")
         }
 
         try {
@@ -1054,9 +1045,10 @@ object CallEngine {
     }
 
     // --- Phone Account Management ---
-    private fun registerPhoneAccount(context: Context) {
+    private fun registerPhoneAccount() {
+        val context = requireContext()
         val telecomManager = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-        val phoneAccountHandle = getPhoneAccountHandle(context)
+        val phoneAccountHandle = getPhoneAccountHandle()
 
         if (telecomManager.getPhoneAccount(phoneAccountHandle) == null) {
             val phoneAccount = PhoneAccount.builder(phoneAccountHandle, "PingMe Call")
@@ -1065,18 +1057,15 @@ object CallEngine {
 
             try {
                 telecomManager.registerPhoneAccount(phoneAccount)
-                Log.d(TAG, "PhoneAccount registered successfully.")
-            } catch (e: SecurityException) {
-                Log.e(TAG, "SecurityException: Cannot register PhoneAccount. Missing MANAGE_OWN_CALLS permission?", e)
+                Log.d(TAG, "PhoneAccount registered successfully")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to register PhoneAccount: ${e.message}", e)
             }
-        } else {
-            Log.d(TAG, "PhoneAccount already registered.")
         }
     }
 
-    private fun getPhoneAccountHandle(context: Context): PhoneAccountHandle {
+    private fun getPhoneAccountHandle(): PhoneAccountHandle {
+        val context = requireContext()
         return PhoneAccountHandle(
             ComponentName(context, MyConnectionService::class.java),
             PHONE_ACCOUNT_ID
@@ -1084,122 +1073,91 @@ object CallEngine {
     }
 
     // --- Media Management ---
-    fun playRingtone(context: Context) {
+    private fun playRingtone() {
+        val context = requireContext()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            Log.d(TAG, "playRingtone: Android S+ detected, system will handle ringtone via Telecom.")
-            return
+            return // System handles it
         }
 
         try {
-            Log.d(TAG, "Playing ringtone (for Android < S).")
             val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
             ringtone = RingtoneManager.getRingtone(context, uri)
-            ringtone?.audioAttributes = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                .build()
             ringtone?.play()
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to play ringtone: ${e.message}", e)
+            Log.e(TAG, "Failed to play ringtone: ${e.message}")
         }
     }
 
     fun stopRingtone() {
         try {
-            if (ringtone?.isPlaying == true) {
-                ringtone?.stop()
-                Log.d(TAG, "Ringtone stopped.")
-            }
+            ringtone?.stop()
         } catch (e: Exception) {
-            Log.e(TAG, "Error stopping ringtone: ${e.message}", e)
+            Log.e(TAG, "Error stopping ringtone: ${e.message}")
         }
         ringtone = null
     }
 
     private fun startRingback() {
-        if (ringbackPlayer?.isPlaying == true) {
-            Log.d(TAG, "Ringback tone already playing.")
-            return
-        }
+        val context = requireContext()
+        if (ringbackPlayer?.isPlaying == true) return
 
         try {
-            val ringbackUri = Uri.parse("android.resource://${appContext?.packageName}/raw/ringback_tone")
-            ringbackPlayer = MediaPlayer.create(appContext, ringbackUri)
-            if (ringbackPlayer == null) {
-                Log.e(TAG, "Failed to create MediaPlayer for ringback. Check raw/ringback_tone.mp3 exists.")
-                return
-            }
-
+            val ringbackUri = Uri.parse("android.resource://${context.packageName}/raw/ringback_tone")
+            ringbackPlayer = MediaPlayer.create(context, ringbackUri)
             ringbackPlayer?.apply {
                 isLooping = true
-                setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                        .build()
-                )
                 start()
-                Log.d(TAG, "Ringback tone started.")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to play ringback tone: ${e.message}", e)
+            Log.e(TAG, "Failed to play ringback tone: ${e.message}")
         }
     }
 
     private fun stopRingback() {
         try {
-            if (ringbackPlayer?.isPlaying == true) {
-                ringbackPlayer?.stop()
-                ringbackPlayer?.release()
-                Log.d(TAG, "Ringback tone stopped and released.")
-            }
+            ringbackPlayer?.stop()
+            ringbackPlayer?.release()
         } catch (e: Exception) {
-            Log.e(TAG, "Error stopping ringback tone: ${e.message}", e)
+            Log.e(TAG, "Error stopping ringback: ${e.message}")
         } finally {
             ringbackPlayer = null
         }
     }
 
-    // --- Event Management ---
-    private fun notifySpecificCallStateChanged(context: Context, callId: String, newState: CallState) {
-        val callInfo = activeCalls[callId] ?: return
-
-        val jsonPayload = JSONObject().apply {
-            put("callId", callId)
-            put("callData", callInfo.callData)
-            put("state", newState.name)
-            put("callType", callInfo.callType)
-        }
-
-        Log.d(TAG, "Specific call state changed. Emitting CALL_STATE_CHANGED for $callId: $newState")
-        emitEvent(CallEventType.CALL_STATE_CHANGED, jsonPayload)
+    // --- Cleanup ---
+    private fun cleanup() {
+        Log.d(TAG, "Performing cleanup")
+        stopForegroundService()
+        keepScreenAwake(false)
+        resetAudioMode()
     }
 
-    private fun updateForegroundNotification(context: Context) {
-        val activeCall = activeCalls.values.find { it.state == CallState.ACTIVE }
-        val heldCall = activeCalls.values.find { it.state == CallState.HELD }
+    // --- Lifecycle Management ---
+    fun onApplicationTerminate() {
+        Log.d(TAG, "Application terminating")
 
-        val callToShow = activeCall ?: heldCall
-        callToShow?.let {
-            val intent = Intent(context, CallForegroundService::class.java)
-            intent.putExtra("UPDATE_NOTIFICATION", true)
-            intent.putExtra("callId", it.callId)
-            intent.putExtra("callData", it.callData)
-            intent.putExtra("state", it.state.name)
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
+        // End all calls properly
+        activeCalls.keys.toList().forEach { callId ->
+            val connection = telecomConnections[callId]
+            connection?.setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
+            connection?.destroy()
         }
-    }
 
-    private fun finalCleanup(context: Context) {
-        Log.d(TAG, "Performing final cleanup - no active calls remaining")
-        stopForegroundService(context)
-        keepScreenAwake(context, false)
-        resetAudioMode(context)
-        isSystemCallActive = false
+        // Clear all state
+        activeCalls.clear()
+        telecomConnections.clear()
+        callMetadata.clear()
+        currentCallId = null
+
+        cleanup()
+
+        // Clear callbacks
+        lockScreenBypassCallbacks.clear()
+        eventHandler = null
+        cachedEvents.clear()
+
+        // Reset initialization
+        isInitialized.set(false)
+        appContext = null
     }
 }
