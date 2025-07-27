@@ -97,4 +97,15 @@ class CallManager : HybridCallManagerSpec() {
         ensureInitialized()
         CallEngine.setMuted(callId, muted)
     }
+
+    override fun updateDisplayCallInformation(callId: String, callerName: String): Unit {
+        // do nothing for now
+    }
+
+    override fun registerVoIPTokenListener(listener: (payload: String) -> Unit): () -> Unit
+        Log.d(TAG, "registerVoIPTokenListener called")
+        return {
+            Log.d(TAG, "registerVoIPTokenListener removed.")
+        }
+    }
 }

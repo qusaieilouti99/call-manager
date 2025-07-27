@@ -24,12 +24,20 @@ export interface CallManager extends HybridObject<{ ios: 'swift'; android: 'kotl
   startCall(callId: string, callType: string, targetName: string, metadata?: string): void;
   setOnHold(callId: string, onHold: boolean): void;
   setMuted(callId: string, muted: boolean): void;
+  updateDisplayCallInformation(callId: string, callerName: string): void;
 
   // Event emitter: addListener returns a remove function
   addListener(
     // Payload for AUDIO_DEVICES_CHANGED now matches AudioDeviceInfo structure
     listener: (event: CallEventType, payload: string) => void
   ): () => void;
+
+  registerVoIPTokenListener(
+    // token payload
+    listener: (payload: string) => void
+  ): () => void;
+
+
 }
 
 
