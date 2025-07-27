@@ -1,6 +1,6 @@
 {
   "name": "@qusaieilouti99/call-manager",
-  "version": "0.1.72",
+  "version": "0.1.78",
   "description": "Call manager",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",

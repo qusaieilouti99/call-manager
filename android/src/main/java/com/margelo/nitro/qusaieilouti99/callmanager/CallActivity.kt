@@ -1,7 +1,7 @@
+// File: CallActivity.kt
 package com.margelo.nitro.qusaieilouti99.callmanager
 
 import android.app.Activity
-import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -11,100 +11,135 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.TextView
 
-class CallActivity : Activity() {
+/**
+ * Full‐screen incoming‐call UI.  Implements CallEndListener
+ * so it always auto‐finishes when the engine ends the call.
+ */
+class CallActivity : Activity(), CallEngine.CallEndListener {
 
-    private enum class FinishReason { ANSWER, DECLINE, TIMEOUT, MANUAL_DISMISS }
-    private var finishReason: FinishReason? = null
-    private var callId: String = ""
-    private var callType: String = "Audio"
+  private enum class FinishReason {
+    ANSWER, DECLINE, TIMEOUT, MANUAL_DISMISS, EXTERNAL_END
+  }
 
-    private val timeoutHandler = Handler(Looper.getMainLooper())
-    private val timeoutRunnable = Runnable {
-        Log.d(TAG, "CallActivity timeout triggered for callId: $callId")
-        finishReason = FinishReason.TIMEOUT
-        CallEngine.endCall(callId)
-        finishCallActivity()
+  private var finishReason: FinishReason? = null
+  private var callId: String = ""
+  private var callType: String = "Audio"
+
+  private val timeoutHandler = Handler(Looper.getMainLooper())
+  private val timeoutRunnable = Runnable {
+    Log.d(TAG, "CallActivity timeout triggered for callId: $callId")
+    finishReason = FinishReason.TIMEOUT
+    CallEngine.stopRingtone()
+    CallEngine.cancelIncomingCallUI()
+    CallEngine.endCall(callId)
+    finishCallActivity()
+  }
+
+  override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    Log.d(TAG, "CallActivity onCreate")
+
+    // Lock‐screen bypass
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+      setShowWhenLocked(true)
+      setTurnScreenOn(true)
+    } else {
+      window.addFlags(
+        WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+        WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+        WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
+      )
     }
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        Log.d(TAG, "CallActivity onCreate")
+    setContentView(R.layout.activity_call)
 
-        // Modern way to handle lock screen bypass (API 27+)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-            setShowWhenLocked(true)
-            setTurnScreenOn(true)
-        } else {
-            // Legacy approach for older versions
-            window.addFlags(
-                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
-                WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
-            )
-        }
+    // Read incoming‐call params
+    callId = intent.getStringExtra("callId") ?: ""
+    callType = intent.getStringExtra("callType") ?: "Audio"
+    Log.d(TAG, "CallActivity received callId: $callId, callType: $callType")
 
-        setContentView(R.layout.activity_call)
+    // Register for call‐end callbacks BEFORE timeout or user can dismiss
+    CallEngine.registerCallEndListener(this)
 
-        callId = intent.getStringExtra("callId") ?: ""
-        callType = intent.getStringExtra("callType") ?: "Audio"
-        Log.d(TAG, "CallActivity received callId: $callId, callType: $callType")
+    // Bind UI
+    val callerName = intent.getStringExtra("callerName") ?: "Unknown"
+    findViewById<TextView>(R.id.caller_name).text = callerName
 
-        // FIXED: Immediate cleanup of notifications when CallActivity is shown
-        CallEngine.cancelIncomingCallUI()
-
-        val callerName = intent.getStringExtra("callerName") ?: "Unknown"
-        val nameView = findViewById<TextView>(R.id.caller_name)
-        val answerBtn = findViewById<Button>(R.id.answer_btn)
-        val declineBtn = findViewById<Button>(R.id.decline_btn)
-
-        nameView.text = callerName
-
-        answerBtn.setOnClickListener {
-            Log.d(TAG, "CallActivity: Answer button clicked for callId: $callId")
-            finishReason = FinishReason.ANSWER
-
-            // FIXED: Use single source of truth - this will handle all cleanup
-            CallEngine.answerCall(callId)
-            finishCallActivity()
-        }
-
-        declineBtn.setOnClickListener {
-            Log.d(TAG, "CallActivity: Decline button clicked for callId: $callId")
-            finishReason = FinishReason.DECLINE
-            CallEngine.endCall(callId)
-            finishCallActivity()
-        }
-
-        timeoutHandler.postDelayed(timeoutRunnable, 60_000)
+    findViewById<Button>(R.id.answer_btn).setOnClickListener {
+      Log.d(TAG, "Answer clicked for callId: $callId")
+      finishReason = FinishReason.ANSWER
+      CallEngine.stopRingtone()
+      CallEngine.cancelIncomingCallUI()
+      CallEngine.answerCall(callId)
+      finishCallActivity()
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        Log.d(TAG, "CallActivity onDestroy for callId: $callId. Reason: $finishReason")
-        timeoutHandler.removeCallbacks(timeoutRunnable)
-
-        // FIXED: Ensure cleanup happens regardless of how activity ends
-        CallEngine.stopRingtone()
-        CallEngine.cancelIncomingCallUI()
+    findViewById<Button>(R.id.decline_btn).setOnClickListener {
+      Log.d(TAG, "Decline clicked for callId: $callId")
+      finishReason = FinishReason.DECLINE
+      CallEngine.stopRingtone()
+      CallEngine.cancelIncomingCallUI()
+      CallEngine.endCall(callId)
+      finishCallActivity()
     }
 
-    override fun onBackPressed() {
-        Log.d(TAG, "CallActivity onBackPressed for callId: $callId. Treating as decline/dismiss.")
-        finishReason = FinishReason.MANUAL_DISMISS
-        CallEngine.endCall(callId)
-        finishCallActivity()
-    }
+    // Start auto‐timeout
+    timeoutHandler.postDelayed(timeoutRunnable, 60_000)
+    Log.d(TAG, "CallActivity setup complete")
+  }
 
-    private fun finishCallActivity() {
-        Log.d(TAG, "Finishing CallActivity.")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            finishAndRemoveTask()
-        } else {
-            finish()
-        }
-    }
+  override fun onDestroy() {
+    super.onDestroy()
+    Log.d(TAG, "CallActivity onDestroy for callId: $callId. Reason: $finishReason")
 
-    companion object {
-        private const val TAG = "CallActivity"
+    // Unregister listener
+    CallEngine.unregisterCallEndListener(this)
+
+    // Cancel timeout
+    timeoutHandler.removeCallbacks(timeoutRunnable)
+
+    // If user never answered, clean up ringtone/UI
+    if (finishReason != FinishReason.ANSWER) {
+      CallEngine.stopRingtone()
+      CallEngine.cancelIncomingCallUI()
     }
+  }
+
+  override fun onBackPressed() {
+    Log.d(TAG, "onBackPressed for callId: $callId → treat as decline")
+    finishReason = FinishReason.MANUAL_DISMISS
+    CallEngine.stopRingtone()
+    CallEngine.cancelIncomingCallUI()
+    CallEngine.endCall(callId)
+    finishCallActivity()
+  }
+
+  /**
+   * Called by CallEngine whenever ANY call ends.
+   * We only care about our own callId.
+   */
+  override fun onCallEnded(endedCallId: String) {
+    if (endedCallId == callId && !isFinishing) {
+      Log.d(TAG, "CallActivity onCallEnded callback for callId: $callId")
+      finishReason = FinishReason.EXTERNAL_END
+      runOnUiThread { finishCallActivity() }
+    }
+  }
+
+  private fun finishCallActivity() {
+    if (isFinishing) {
+      Log.d(TAG, "Already finishing, skip.")
+      return
+    }
+    Log.d(TAG, "Finishing CallActivity for callId: $callId")
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+      finishAndRemoveTask()
+    } else {
+      finish()
+    }
+  }
+
+  companion object {
+    private const val TAG = "CallActivity"
+  }
 }
