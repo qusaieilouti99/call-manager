@@ -40,6 +40,7 @@ public class CallEngine {
 
         callKitManager = CallKitManager(delegate: self)
         audioManager = AudioManager(delegate: self)
+        VoIPTokenManager.shared.setupPushKit()
 
         isInitialized = true
         logger.info("🚀 ✅ CallEngine initialized successfully")
@@ -54,7 +55,8 @@ public class CallEngine {
         logger.debug("🚀 Getting current call state...")
         let callsArray = self.activeCalls.values.map { $0.toJSONObject() }
         do {
-            let jsonData = try JSONSerialization.data(withJSONObject: callsArray, options: [])
+            // Line 466 (previously)
+            let jsonData = try JSONSerialization.data(withJSONObject: callsArray as Any, options: JSONSerialization.WritingOptions.prettyPrinted)
             let result = String(data: jsonData, encoding: .utf8) ?? "[]"
             logger.debug("🚀 Current call state: \(result)")
             return result
@@ -85,16 +87,17 @@ public class CallEngine {
             return
         }
 
-        if let activeCall = self.activeCalls.values.first(where: { $0.state == .active || $0.state == .held }),
-           !canMakeMultipleCalls {
-            logger.warning("📞 ⚠️ Active call exists when receiving incoming call. Auto-rejecting: \(callId)")
-            rejectIncomingCallCollision(callId: callId, reason: "Another call is already active")
-            return
+        if !canMakeMultipleCalls {
+            if let activeCall = self.activeCalls.values.first(where: { $0.state == .active || $0.state == .held }) {
+                logger.warning("📞 ⚠️ Active call (\(activeCall.callId)) exists when receiving incoming call. Auto-rejecting: \(callId)")
+                rejectIncomingCallCollision(callId: callId, reason: "Another call is already active")
+                return
+            }
         }
 
-        if !canMakeMultipleCalls {
+        if canMakeMultipleCalls {
             for call in self.activeCalls.values where call.state == .active {
-                logger.info("📞 Holding existing active call: \(call.callId)")
+                logger.info("📞 Holding existing active call: \(call.callId) before new incoming call")
                 holdCallInternal(callId: call.callId, heldBySystem: false)
             }
         }
@@ -111,6 +114,8 @@ public class CallEngine {
         self.currentCallId = callId
         logger.info("📞 Call added to active calls. Total: \(self.activeCalls.count)")
 
+        audioManager?.configureAudioSession(forCallType: callType == "Video", isIncoming: true)
+
         self.callKitManager?.reportIncomingCall(callInfo: callInfo) { [weak self] error in
             guard let self = self else { return }
             if let error = error {
@@ -118,7 +123,6 @@ public class CallEngine {
                 self.endCallInternal(callId: callId)
             } else {
                 self.logger.info("📞 ✅ Successfully reported incoming call for \(callId)")
-                self.audioManager?.configureForIncomingCall()
             }
         }
     }
@@ -145,9 +149,9 @@ public class CallEngine {
             return
         }
 
-        if !canMakeMultipleCalls {
+        if canMakeMultipleCalls {
             for call in self.activeCalls.values where call.state == .active {
-                logger.info("📞 Holding existing active call: \(call.callId)")
+                logger.info("📞 Holding existing active call: \(call.callId) before new outgoing call")
                 holdCallInternal(callId: call.callId, heldBySystem: false)
             }
         }
@@ -164,14 +168,15 @@ public class CallEngine {
         self.currentCallId = callId
         logger.info("📞 Call added to active calls. Total: \(self.activeCalls.count)")
 
+        audioManager?.configureAudioSession(forCallType: callType == "Video", isIncoming: false)
+
         self.callKitManager?.startOutgoingCall(callInfo: callInfo) { [weak self] error in
             guard let self = self else { return }
             if let error = error {
                 self.logger.error("📞 ❌ Failed to start outgoing call: \(error.localizedDescription)")
                 self.endCallInternal(callId: callId)
             } else {
-                self.logger.info("📞 ✅ Successfully started outgoing call for \(callId)")
-                self.audioManager?.configureForOutgoingCall(isVideo: callType == "Video")
+                self.logger.info("📞 ✅ Successfully initiated outgoing call for \(callId) via CallKit")
             }
         }
     }
@@ -194,9 +199,9 @@ public class CallEngine {
             return
         }
 
-        if !canMakeMultipleCalls {
+        if canMakeMultipleCalls {
             for call in self.activeCalls.values where call.state == .active {
-                logger.info("📞 Holding existing active call: \(call.callId)")
+                logger.info("📞 Holding existing active call: \(call.callId) before new direct active call")
                 holdCallInternal(callId: call.callId, heldBySystem: false)
             }
         }
@@ -213,9 +218,10 @@ public class CallEngine {
         self.currentCallId = callId
         logger.info("📞 Call added as ACTIVE. Total: \(self.activeCalls.count)")
 
-        self.audioManager?.configureForActiveCall(isVideo: callType == "Video")
-        emitOutgoingCallAnsweredWithMetadata(callId: callId)
+        audioManager?.configureAudioSession(forCallType: callType == "Video", isIncoming: false)
+        audioManager?.activateAudioSession()
 
+        emitOutgoingCallAnsweredWithMetadata(callId: callId)
         logger.info("📞 ✅ Call \(callId) started as ACTIVE")
     }
 
@@ -226,7 +232,19 @@ public class CallEngine {
 
     public func answerCall(callId: String) {
         logger.info("📞 Local party answering: \(callId)")
-        coreCallAnswered(callId: callId, isLocalAnswer: true)
+        if let uuid = UUID(uuidString: callId) {
+            let answerAction = CXAnswerCallAction(call: uuid)
+            let transaction = CXTransaction(action: answerAction)
+            callKitManager?.callController.request(transaction) { error in
+                if let error = error {
+                    self.logger.error("📞 ❌ Failed to request CallKit answer: \(error.localizedDescription)")
+                } else {
+                    self.logger.info("📞 ✅ Requested CallKit to answer call \(callId)")
+                }
+            }
+        } else {
+            logger.warning("📞 ⚠️ Invalid UUID for callId: \(callId)")
+        }
     }
 
     private func coreCallAnswered(callId: String, isLocalAnswer: Bool) {
@@ -244,11 +262,11 @@ public class CallEngine {
 
         logger.info("📞 Call state updated: \(previousState.stringValue) → \(CallState.active.stringValue)")
 
-        self.audioManager?.configureForActiveCall(isVideo: callInfo.callType == "Video")
+        audioManager?.configureAudioSession(forCallType: callInfo.callType == "Video", isIncoming: false)
 
         if !canMakeMultipleCalls {
-            for call in self.activeCalls.values where call.callId != callId && call.state == .active {
-                logger.info("📞 Holding other active call: \(call.callId)")
+            for call in self.activeCalls.values where call.callId != callId && (call.state == .active || call.state == .incoming) {
+                logger.info("📞 Holding other active/incoming call: \(call.callId)")
                 holdCallInternal(callId: call.callId, heldBySystem: false)
             }
         }
@@ -282,19 +300,22 @@ public class CallEngine {
     private func holdCallInternal(callId: String, heldBySystem: Bool) {
         logger.info("📞 Holding call internally: callId=\(callId), heldBySystem=\(heldBySystem)")
 
-        guard var callInfo = self.activeCalls[callId], callInfo.state == .active else {
-            logger.warning("📞 ⚠️ Cannot hold call \(callId) - not in active state")
+        guard var callInfo = self.activeCalls[callId] else {
+            logger.warning("📞 ⚠️ Cannot hold call \(callId) - not found")
             return
         }
 
-        callInfo.updateState(.held)
-        callInfo.wasHeldBySystem = heldBySystem
-        self.activeCalls[callId] = callInfo
+        if callInfo.state == .active {
+            callInfo.updateState(.held)
+            callInfo.wasHeldBySystem = heldBySystem
+            self.activeCalls[callId] = callInfo
 
-        self.callKitManager?.setCallOnHold(callId: callId, onHold: true)
-        emitEvent(.callHeld, data: ["callId": callId])
-
-        logger.info("📞 ✅ Call \(callId) held successfully")
+            self.callKitManager?.setCallOnHold(callId: callId, onHold: true)
+            emitEvent(.callHeld, data: ["callId": callId])
+            logger.info("📞 ✅ Call \(callId) held successfully")
+        } else {
+            logger.warning("📞 ⚠️ Cannot hold call \(callId) from state \(callInfo.state.stringValue). Expected .active")
+        }
     }
 
     public func unholdCall(callId: String) {
@@ -304,19 +325,23 @@ public class CallEngine {
     private func unholdCallInternal(callId: String, resumedBySystem: Bool) {
         logger.info("📞 Unholding call internally: callId=\(callId), resumedBySystem=\(resumedBySystem)")
 
-        guard var callInfo = self.activeCalls[callId], callInfo.state == .held else {
-            logger.warning("📞 ⚠️ Cannot unhold call \(callId) - not in held state")
+        guard var callInfo = self.activeCalls[callId] else {
+            logger.warning("📞 ⚠️ Cannot unhold call \(callId) - not found")
             return
         }
 
-        callInfo.updateState(.active)
-        callInfo.wasHeldBySystem = false
-        self.activeCalls[callId] = callInfo
+        if callInfo.state == .held {
+            callInfo.updateState(.active)
+            callInfo.wasHeldBySystem = false
+            self.activeCalls[callId] = callInfo
 
-        self.callKitManager?.setCallOnHold(callId: callId, onHold: false)
-        emitEvent(.callUnheld, data: ["callId": callId])
-
-        logger.info("📞 ✅ Call \(callId) unheld successfully")
+            self.currentCallId = callId
+            self.callKitManager?.setCallOnHold(callId: callId, onHold: false)
+            emitEvent(.callUnheld, data: ["callId": callId])
+            logger.info("📞 ✅ Call \(callId) unheld successfully")
+        } else {
+            logger.warning("📞 ⚠️ Cannot unhold call \(callId) from state \(callInfo.state.stringValue). Expected .held")
+        }
     }
 
     public func setMuted(callId: String, muted: Bool) {
@@ -327,7 +352,8 @@ public class CallEngine {
             return
         }
 
-        self.audioManager?.setMuted(muted)
+        self.callKitManager?.setMuted(callId: callId, muted: muted)
+
         let eventType: CallEventType = muted ? .callMuted : .callUnmuted
         emitEvent(eventType, data: ["callId": callId])
         logger.info("📞 ✅ Call \(callId) mute state changed to: \(muted)")
@@ -335,7 +361,21 @@ public class CallEngine {
 
     public func endCall(callId: String) {
         logger.info("📞 Ending call: \(callId)")
-        endCallInternal(callId: callId)
+        if let uuid = UUID(uuidString: callId) {
+            let endCallAction = CXEndCallAction(call: uuid)
+            let transaction = CXTransaction(action: endCallAction)
+            callKitManager?.callController.request(transaction) { error in
+                if let error = error {
+                    self.logger.error("📞 ❌ Failed to request CallKit end call: \(error.localizedDescription)")
+                    self.endCallInternal(callId: callId)
+                } else {
+                    self.logger.info("📞 ✅ Requested CallKit to end call \(callId)")
+                }
+            }
+        } else {
+            logger.warning("📞 ⚠️ Invalid UUID for end call: \(callId)")
+            self.endCallInternal(callId: callId)
+        }
     }
 
     public func endAllCalls() {
@@ -344,22 +384,17 @@ public class CallEngine {
         let callIds = Array(self.activeCalls.keys)
         for callId in callIds {
             logger.info("📞 Ending call: \(callId)")
-            endCallInternal(callId: callId)
+            endCall(callId: callId)
         }
 
-        self.activeCalls.removeAll()
-        self.callMetadata.removeAll()
-        self.currentCallId = nil
-
-        self.audioManager?.cleanup()
-        logger.info("📞 ✅ All calls ended and cleanup completed")
+        logger.info("📞 ✅ All calls termination initiated")
     }
 
     private func endCallInternal(callId: String) {
         logger.info("📞 Ending call internally: \(callId)")
 
         guard var callInfo = self.activeCalls[callId] else {
-            logger.warning("📞 ⚠️ Call \(callId) not found in active calls")
+            logger.warning("📞 ⚠️ Call \(callId) not found in active calls (already ended?)")
             return
         }
 
@@ -368,15 +403,13 @@ public class CallEngine {
         self.activeCalls.removeValue(forKey: callId)
 
         if self.currentCallId == callId {
-            self.currentCallId = self.activeCalls.values.first { $0.state != .ended }?.callId
+            self.currentCallId = self.activeCalls.values.first { $0.state == .active || $0.state == .held || $0.state == .dialing || $0.state == .incoming }?.callId
             logger.info("📞 Current call ID updated to: \(self.currentCallId ?? "nil")")
         }
 
-        self.callKitManager?.endCall(callId: callId)
-
         if self.activeCalls.isEmpty {
-            logger.info("📞 No more active calls, cleaning up audio")
-            self.audioManager?.cleanup()
+            logger.info("📞 No more active calls, deactivating audio session")
+            audioManager?.deactivateAudioSession()
         }
 
         logger.info("📞 Notifying \(self.callEndListeners.count) internal call end listeners")
@@ -430,7 +463,7 @@ public class CallEngine {
         if let handler = handler, !self.cachedEvents.isEmpty {
             logger.info("📡 Emitting \(self.cachedEvents.count) cached events")
             for (type, data) in self.cachedEvents {
-                logger.debug("📡 Emitting cached event: \(type)")
+                logger.debug("📡 Emitting cached event: \(type.rawValue)")
                 handler(type, data)
             }
             self.cachedEvents.removeAll()
@@ -439,18 +472,19 @@ public class CallEngine {
     }
 
     private func emitEvent(_ type: CallEventType, data: [String: Any]) {
-        logger.info("📡 Emitting event: \(type)")
+        logger.info("📡 Emitting event: \(type.rawValue)")
         logger.debug("📡 Event data: \(data)")
 
         do {
-            let jsonData = try JSONSerialization.data(withJSONObject: data, options: [])
+            // Line 486 (previously)
+            let jsonData = try JSONSerialization.data(withJSONObject: data as Any, options: JSONSerialization.WritingOptions.prettyPrinted)
             let dataString = String(data: jsonData, encoding: .utf8) ?? "{}"
 
             if let eventHandler = self.eventHandler {
                 logger.debug("📡 Calling event handler with data: \(dataString)")
                 eventHandler(type, dataString)
             } else {
-                logger.info("📡 No event handler, caching event: \(type)")
+                logger.info("📡 No event handler, caching event: \(type.rawValue)")
                 self.cachedEvents.append((type, dataString))
             }
         } catch {
@@ -565,7 +599,7 @@ public class CallEngine {
 extension CallEngine: CallKitManagerDelegate {
     func callKitManager(_ manager: CallKitManager, didAnswerCall callId: String) {
         logger.info("📲 CallKit delegate: answer call \(callId)")
-        answerCall(callId: callId)
+        coreCallAnswered(callId: callId, isLocalAnswer: true)
     }
 
     func callKitManager(_ manager: CallKitManager, didEndCall callId: String) {
@@ -586,6 +620,25 @@ extension CallEngine: CallKitManagerDelegate {
         logger.info("📲 CallKit delegate: set muted \(callId), muted: \(muted)")
         setMuted(callId: callId, muted: muted)
     }
+
+    func callKitManager(_ manager: CallKitManager, didStartOutgoingCall callId: String) {
+        logger.info("📲 CallKit delegate: did start outgoing call \(callId)")
+        if var callInfo = activeCalls[callId], callInfo.state == .dialing {
+            callInfo.updateState(.active)
+            activeCalls[callId] = callInfo
+            logger.info("📞 Call \(callId) transitioned from DIALING to ACTIVE as reported by CallKit")
+        }
+    }
+
+    func callKitManager(_ manager: CallKitManager, didActivateAudioSession session: AVAudioSession) {
+        logger.info("📲 CallKit delegate: did activate audio session")
+        audioManager?.activateAudioSession()
+    }
+
+    func callKitManager(_ manager: CallKitManager, didDeactivateAudioSession session: AVAudioSession) {
+        logger.info("📲 CallKit delegate: did deactivate audio session")
+        audioManager?.deactivateAudioSession()
+    }
 }
 
 extension CallEngine: AudioManagerDelegate {
@@ -605,5 +658,13 @@ extension CallEngine: AudioManagerDelegate {
             "currentRoute": routeInfo.currentRoute
         ]
         emitEvent(.audioDevicesChanged, data: eventData)
+    }
+
+    func audioManagerDidActivateAudioSession(_ manager: AudioManager) {
+        logger.info("🔊 Audio manager delegate: audio session activated")
+    }
+
+    func audioManagerDidDeactivateAudioSession(_ manager: AudioManager) {
+        logger.info("🔊 Audio manager delegate: audio session deactivated")
     }
 }

@@ -5,6 +5,8 @@ import OSLog
 protocol AudioManagerDelegate: AnyObject {
     func audioManager(_ manager: AudioManager, didChangeRoute routeInfo: AudioRoutesInfo)
     func audioManager(_ manager: AudioManager, didChangeDevices routeInfo: AudioRoutesInfo)
+    func audioManagerDidActivateAudioSession(_ manager: AudioManager)
+    func audioManagerDidDeactivateAudioSession(_ manager: AudioManager)
 }
 
 class AudioManager {
@@ -55,55 +57,33 @@ class AudioManager {
         logger.info("🔊 ✅ Audio session notifications setup completed")
     }
 
-    func configureForIncomingCall() {
-        logger.info("🔊 Configuring audio session for incoming call...")
+    // MARK: - Audio Session Configuration for CallKit
 
-        do {
-            try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .allowBluetoothA2DP])
-            try audioSession.setActive(true)
-            logger.info("🔊 ✅ Audio session configured for incoming call")
-        } catch {
-            logger.error("🔊 ❌ Failed to configure audio session for incoming call: \(error.localizedDescription)")
+    func configureAudioSession(forCallType isVideo: Bool, isIncoming: Bool) {
+        logger.info("🔊 Configuring audio session: isVideo=\(isVideo), isIncoming=\(isIncoming)...")
+
+        let options: AVAudioSession.CategoryOptions
+        if isVideo {
+            options = [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker]
+        } else {
+            options = [.allowBluetooth, .allowBluetoothA2DP]
         }
-    }
-
-    func configureForOutgoingCall(isVideo: Bool) {
-        logger.info("🔊 Configuring audio session for outgoing call (video: \(isVideo))...")
 
         do {
-            let options: AVAudioSession.CategoryOptions = isVideo ?
-                [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker] :
-                [.allowBluetooth, .allowBluetoothA2DP]
-
             try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: options)
-            try audioSession.setActive(true)
-            logger.info("🔊 ✅ Audio session configured for outgoing call (video: \(isVideo))")
+            logger.info("🔊 ✅ Audio session category/mode/options set for call")
         } catch {
-            logger.error("🔊 ❌ Failed to configure audio session for outgoing call: \(error.localizedDescription)")
+            logger.error("🔊 ❌ Failed to configure audio session: \(error.localizedDescription)")
         }
     }
 
-    func configureForActiveCall(isVideo: Bool) {
-        logger.info("🔊 Configuring audio session for active call (video: \(isVideo))...")
-
-        do {
-            let options: AVAudioSession.CategoryOptions = isVideo ?
-                [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker] :
-                [.allowBluetooth, .allowBluetoothA2DP]
-
-            try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: options)
-            try audioSession.setActive(true)
-            logger.info("🔊 ✅ Audio session configured for active call (video: \(isVideo))")
-        } catch {
-            logger.error("🔊 ❌ Failed to configure audio session for active call: \(error.localizedDescription)")
-        }
-    }
+    // MARK: - Audio Route Management
 
     func getAudioDevices() -> AudioRoutesInfo {
         logger.debug("🔊 Getting available audio devices...")
 
         let currentRoute = audioSession.currentRoute
-        var devices: [String] = ["Earpiece", "Speaker"]
+        var devices: [String] = ["Earpiece", "Speaker"] // Default options
 
         logger.debug("🔊 Current route inputs: \(currentRoute.inputs.map { $0.portType.rawValue })")
         logger.debug("🔊 Current route outputs: \(currentRoute.outputs.map { $0.portType.rawValue })")
@@ -118,7 +98,7 @@ class AudioManager {
                         devices.append("Bluetooth")
                         logger.debug("🔊 Added Bluetooth device")
                     }
-                case .headphones, .headsetMic, .wiredHeadphones:
+                case .headphones, .headsetMic:
                     if !devices.contains("Headset") {
                         devices.append("Headset")
                         logger.debug("🔊 Added Headset device")
@@ -151,13 +131,10 @@ class AudioManager {
                 logger.debug("🔊 Overriding to speaker...")
                 try audioSession.overrideOutputAudioPort(.speaker)
             case "Earpiece":
-                logger.debug("🔊 Overriding to earpiece...")
+                logger.debug("🔊 Overriding to earpiece (built-in receiver)...")
                 try audioSession.overrideOutputAudioPort(.none)
-            case "Bluetooth":
-                logger.debug("🔊 Setting to Bluetooth (system managed)...")
-                try audioSession.overrideOutputAudioPort(.none)
-            case "Headset":
-                logger.debug("🔊 Setting to Headset (system managed)...")
+            case "Bluetooth", "Headset":
+                logger.debug("🔊 Setting to Bluetooth/Headset (system managed via .none)...")
                 try audioSession.overrideOutputAudioPort(.none)
             default:
                 logger.warning("🔊 ⚠️ Unknown audio route: \(route)")
@@ -179,16 +156,31 @@ class AudioManager {
         logger.info("🔊 Mute state changed to: \(muted)")
     }
 
-    func cleanup() {
-        logger.info("🔊 Cleaning up audio session...")
+    // MARK: - Audio Session Activation/Deactivation from CallKit
 
+    func activateAudioSession() {
+        logger.info("🔊 Audio session activation requested by CallKit...")
+        do {
+            try audioSession.setActive(true)
+            logger.info("🔊 ✅ Audio session activated successfully")
+            delegate?.audioManagerDidActivateAudioSession(self)
+        } catch {
+            logger.error("🔊 ❌ Failed to activate audio session: \(error.localizedDescription)")
+        }
+    }
+
+    func deactivateAudioSession() {
+        logger.info("🔊 Audio session deactivation requested by CallKit...")
         do {
             try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
             logger.info("🔊 ✅ Audio session deactivated successfully")
+            delegate?.audioManagerDidDeactivateAudioSession(self)
         } catch {
             logger.error("🔊 ❌ Failed to deactivate audio session: \(error.localizedDescription)")
         }
     }
+
+    // MARK: - Internal Helper Methods
 
     private func getCurrentAudioRoute() -> String {
         let currentRoute = audioSession.currentRoute
@@ -202,11 +194,12 @@ class AudioManager {
                 return "Bluetooth"
             case .builtInSpeaker:
                 return "Speaker"
-            case .headphones, .headsetMic, .wiredHeadphones:
+            case .headphones, .headsetMic:
                 return "Headset"
             case .builtInReceiver:
                 return "Earpiece"
             default:
+                logger.debug("🔊 Unhandled output type: \(routeType.rawValue)")
                 continue
             }
         }
@@ -227,6 +220,8 @@ class AudioManager {
         self.delegate?.audioManager(self, didChangeDevices: routeInfo)
     }
 
+    // MARK: - Notification Handlers
+
     private func handleAudioRouteChanged(notification: Notification) {
         logger.info("🔊 Audio route changed notification received")
 
@@ -237,17 +232,20 @@ class AudioManager {
             return
         }
 
-        logger.info("🔊 Route change reason: \(reason)")
+        logger.info("🔊 Route change reason: \(reason.rawValue)")
 
         switch reason {
-        case .newDeviceAvailable, .oldDeviceUnavailable:
-            logger.info("🔊 Audio device availability changed: \(reason)")
+        case AVAudioSession.RouteChangeReason.newDeviceAvailable, AVAudioSession.RouteChangeReason.oldDeviceUnavailable:
+            logger.info("🔊 Audio device availability changed: \(reason.rawValue)") // Use .rawValue
             notifyDeviceChange()
-        case .override, .categoryChange:
-            logger.info("🔊 Audio route override or category change: \(reason)")
+        case AVAudioSession.RouteChangeReason.override, AVAudioSession.RouteChangeReason.categoryChange:
+            logger.info("🔊 Audio route override or category change: \(reason.rawValue)") // Use .rawValue
+            notifyRouteChange()
+        case AVAudioSession.RouteChangeReason.wakeFromSleep, AVAudioSession.RouteChangeReason.noSuitableRouteForCategory:
+            logger.info("🔊 Session recovered or no suitable route: \(reason.rawValue)") // Use .rawValue
             notifyRouteChange()
         default:
-            logger.info("🔊 Other audio route change reason: \(reason)")
+            logger.info("🔊 Other audio route change reason: \(reason.rawValue)") // Use .rawValue
             notifyRouteChange()
         }
     }

@@ -29,13 +29,13 @@ public struct CallInfo {
     mutating func updateState(_ newState: CallState) {
         let oldState = self.state
         self.state = newState
-        Self.logger.info("📱 CallInfo state changed: callId=\(callId), \(oldState.stringValue) → \(newState.stringValue)")
+        Self.logger.info("📱 CallInfo state changed: c\\ \(oldState.stringValue) → \(newState.stringValue)")
     }
 
     mutating func updateDisplayName(_ newName: String) {
         let oldName = self.displayName
         self.displayName = newName
-        Self.logger.info("📱 CallInfo display name updated: callId=\(callId), '\(oldName)' → '\(newName)'")
+        Self.logger.info("📱 CallInfo display name updated: ca, '\(oldName)' → '\(newName)'")
     }
 
     func toJSONObject() -> [String: Any] {

@@ -1,6 +1,7 @@
 import Foundation
 import NitroModules
 import OSLog
+import UIKit
 
 public class CallManager: HybridCallManagerSpec {
     private let logger = Logger(subsystem: "com.qusaieilouti99.callmanager", category: "CallManager")
@@ -21,20 +22,20 @@ public class CallManager: HybridCallManagerSpec {
         logger.info("🎯📞 endCall requested for callId: \(callId)")
         ensureInitialized()
         CallEngine.shared.endCall(callId: callId)
-        logger.info("🎯📞 ✅ endCall completed for callId: \(callId)")
+        logger.info("🎯📞 ✅ endCall initiated for callId: \(callId)")
     }
 
     public func endAllCalls() throws {
         logger.info("🎯📞 endAllCalls requested")
         ensureInitialized()
         CallEngine.shared.endAllCalls()
-        logger.info("🎯📞 ✅ endAllCalls completed")
+        logger.info("🎯📞 ✅ endAllCalls initiated")
     }
 
     public func silenceRingtone() throws {
         logger.info("🎯🔇 silenceRingtone requested")
         ensureInitialized()
-        logger.info("🎯🔇 ✅ silenceRingtone completed (handled by CallKit)")
+        logger.info("🎯🔇 ✅ silenceRingtone completed (handled by CallKit or implied by call action)")
     }
 
     public func getAudioDevices() throws -> AudioRoutesInfo {
@@ -55,15 +56,19 @@ public class CallManager: HybridCallManagerSpec {
     public func keepScreenAwake(keepAwake: Bool) throws {
         logger.info("🎯💡 keepScreenAwake requested: \(keepAwake)")
         ensureInitialized()
-        logger.info("🎯💡 ✅ keepScreenAwake completed (handled by CallKit)")
+        DispatchQueue.main.async {
+            UIApplication.shared.isIdleTimerDisabled = keepAwake
+            self.logger.info("🎯💡 ✅ UIApplication.shared.isIdleTimerDisabled set to: \(keepAwake)")
+        }
     }
 
     public func addListener(listener: @escaping (CallEventType, String) -> Void) throws -> () -> Void {
         logger.info("🎯📡 addListener called")
         ensureInitialized()
 
-        CallEngine.shared.setEventHandler { [weak self] eventType, payload in
-            self?.logger.debug("🎯📡 Event emitted: \(eventType), payload length: \(payload.count)")
+        // Line 70 (previously): Explicitly type closure parameters for clarity
+        CallEngine.shared.setEventHandler { [weak self] (eventType: CallEventType, payload: String) in
+            self?.logger.debug("🎯📡 Event emitted:  payload length: \(payload.count)")
             listener(eventType, payload)
         }
 
@@ -83,7 +88,7 @@ public class CallManager: HybridCallManagerSpec {
         }
         ensureInitialized()
         CallEngine.shared.startOutgoingCall(callId: callId, callType: callType, targetName: targetName, metadata: metadata)
-        logger.info("🎯📞 ✅ startOutgoingCall completed for callId: \(callId)")
+        logger.info("🎯📞 ✅ startOutgoingCall initiated for callId: \(callId)")
     }
 
     public func startCall(callId: String, callType: String, targetName: String, metadata: String?) throws {
@@ -93,7 +98,7 @@ public class CallManager: HybridCallManagerSpec {
         }
         ensureInitialized()
         CallEngine.shared.startCall(callId: callId, callType: callType, targetName: targetName, metadata: metadata)
-        logger.info("🎯📞 ✅ startCall completed for callId: \(callId)")
+        logger.info("🎯📞 ✅ startCall initiated for callId: \(callId)")
     }
 
     public func callAnswered(callId: String) throws {
