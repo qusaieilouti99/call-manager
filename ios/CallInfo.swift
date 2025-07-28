@@ -23,13 +23,13 @@ public struct CallInfo {
         self.wasHeldBySystem = false
         self.isManuallySilenced = false
 
-        Self.logger.info("📱 CallInfo created: callId=\(callId), type=\(callType), name=\(displayName), state=\(state.rawValue)")
+        Self.logger.info("📱 CallInfo created: callId=\(callId), type=\(callType), name=\(displayName), state=\(state.stringValue)")
     }
 
     mutating func updateState(_ newState: CallState) {
         let oldState = self.state
         self.state = newState
-        Self.logger.info("📱 CallInfo state changed: callId=\(callId), \(oldState.rawValue) → \(newState.rawValue)")
+        Self.logger.info("📱 CallInfo state changed: callId=\(callId), \(oldState.stringValue) → \(newState.stringValue)")
     }
 
     mutating func updateDisplayName(_ newName: String) {
@@ -43,7 +43,7 @@ public struct CallInfo {
             "callId": callId,
             "callType": callType,
             "displayName": displayName,
-            "state": state.rawValue,
+            "state": state.stringValue,
             "timestamp": timestamp,
             "wasHeldBySystem": wasHeldBySystem
         ]
@@ -63,4 +63,8 @@ public enum CallState: String, CaseIterable {
     case active = "ACTIVE"
     case held = "HELD"
     case ended = "ENDED"
+
+    var stringValue: String {
+        return self.rawValue
+    }
 }

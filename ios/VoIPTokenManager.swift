@@ -2,7 +2,7 @@ import Foundation
 import PushKit
 import OSLog
 
-class VoIPTokenManager: NSObject {
+class VoIPTokenManager {
     static let shared = VoIPTokenManager()
 
     private let logger = Logger(subsystem: "com.qusaieilouti99.callmanager", category: "VoIPTokenManager")
@@ -10,8 +10,7 @@ class VoIPTokenManager: NSObject {
     private var tokenListener: ((String) -> Void)?
     private var cachedToken: String?
 
-    private override init() {
-        super.init()
+    private init() {
         logger.info("🔑 VoIPTokenManager initializing...")
         setupPushKit()
     }
@@ -19,17 +18,16 @@ class VoIPTokenManager: NSObject {
     private func setupPushKit() {
         logger.info("🔑 Setting up PushKit registry...")
         pushRegistry = PKPushRegistry(queue: DispatchQueue.main)
-        pushRegistry?.delegate = self
+        pushRegistry?.delegate = VoIPPushDelegate(manager: self)
         pushRegistry?.desiredPushTypes = [.voIP]
         logger.info("🔑 PushKit registry setup completed successfully")
     }
 
     func registerTokenListener(_ listener: @escaping (String) -> Void) {
         logger.info("🔑 Registering VoIP token listener...")
-        tokenListener = listener
+        self.tokenListener = listener
 
-        // If we have a cached token, immediately return it
-        if let cachedToken = cachedToken {
+        if let cachedToken = self.cachedToken {
             logger.info("🔑 Returning cached VoIP token: \(cachedToken.prefix(10))...")
             listener(cachedToken)
         } else {
@@ -39,7 +37,54 @@ class VoIPTokenManager: NSObject {
 
     func unregisterTokenListener() {
         logger.info("🔑 Unregistering VoIP token listener")
-        tokenListener = nil
+        self.tokenListener = nil
+    }
+
+    fileprivate func handleTokenUpdate(deviceToken: String) {
+        logger.info("🔑 ✅ VoIP Device Token received: \(deviceToken.prefix(10))...\(deviceToken.suffix(10))")
+
+        self.cachedToken = deviceToken
+        logger.info("🔑 Token cached successfully")
+
+        if let tokenListener = self.tokenListener {
+            logger.info("🔑 Calling token listener with new token")
+            tokenListener(deviceToken)
+        } else {
+            logger.info("🔑 No token listener registered, token will be returned when listener is added")
+        }
+    }
+
+    fileprivate func handleIncomingPush(payload: [String: Any]) {
+        logger.info("🔔 Received VoIP push notification")
+        logger.debug("🔔 Full payload: \(payload)")
+
+        if let notificationType = payload["type"] as? String {
+            logger.info("🔔 Notification type: \(notificationType)")
+            switch notificationType {
+            case "Call":
+                logger.info("🔔 Processing incoming call notification...")
+                handleIncomingCall(payload: payload)
+            case "EndCall":
+                logger.info("🔔 Processing end call notification...")
+                handleEndCall(payload: payload)
+            default:
+                logger.warning("🔔 ⚠️ Unknown VoIP notification type: \(notificationType)")
+            }
+        } else {
+            logger.info("🔔 No type specified, assuming incoming call...")
+            handleIncomingCall(payload: payload)
+        }
+
+        logger.info("🔔 ✅ VoIP push notification processing completed")
+    }
+
+    fileprivate func handleTokenInvalidation() {
+        logger.warning("🔑 ⚠️ VoIP push token invalidated")
+        self.cachedToken = nil
+        if let tokenListener = self.tokenListener {
+            logger.info("🔑 Notifying listener about token invalidation")
+            tokenListener("")
+        }
     }
 
     private func handleIncomingCall(payload: [String: Any]) {
@@ -98,61 +143,25 @@ class VoIPTokenManager: NSObject {
     }
 }
 
-// MARK: - PKPushRegistryDelegate
-extension VoIPTokenManager: PKPushRegistryDelegate {
+private class VoIPPushDelegate: NSObject, PKPushRegistryDelegate {
+    private weak var manager: VoIPTokenManager?
+
+    init(manager: VoIPTokenManager) {
+        self.manager = manager
+        super.init()
+    }
+
     func pushRegistry(_ registry: PKPushRegistry, didUpdate pushCredentials: PKPushCredentials, for type: PKPushType) {
-        logger.info("🔑 VoIP push credentials updated for type: \(type)")
-
         let deviceToken = pushCredentials.token.map { String(format: "%02.2hhx", $0) }.joined()
-        logger.info("🔑 ✅ VoIP Device Token received: \(deviceToken.prefix(10))...\(deviceToken.suffix(10))")
-
-        // Cache the token
-        cachedToken = deviceToken
-        logger.info("🔑 Token cached successfully")
-
-        // Notify the listener about the new token
-        if let tokenListener = tokenListener {
-            logger.info("🔑 Calling token listener with new token")
-            tokenListener(deviceToken)
-        } else {
-            logger.info("🔑 No token listener registered, token will be returned when listener is added")
-        }
+        manager?.handleTokenUpdate(deviceToken: deviceToken)
     }
 
     func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload, for type: PKPushType, completion: @escaping () -> Void) {
-        logger.info("🔔 Received VoIP push notification")
-        logger.debug("🔔 Full payload: \(payload.dictionaryPayload)")
-
-        let payloadDict = payload.dictionaryPayload
-
-        // Handle different notification types
-        if let notificationType = payloadDict["type"] as? String {
-            logger.info("🔔 Notification type: \(notificationType)")
-            switch notificationType {
-            case "Call":
-                logger.info("🔔 Processing incoming call notification...")
-                handleIncomingCall(payload: payloadDict)
-            case "EndCall":
-                logger.info("🔔 Processing end call notification...")
-                handleEndCall(payload: payloadDict)
-            default:
-                logger.warning("🔔 ⚠️ Unknown VoIP notification type: \(notificationType)")
-            }
-        } else {
-            logger.info("🔔 No type specified, assuming incoming call...")
-            handleIncomingCall(payload: payloadDict)
-        }
-
-        logger.info("🔔 ✅ VoIP push notification processing completed")
+        manager?.handleIncomingPush(payload: payload.dictionaryPayload)
         completion()
     }
 
     func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) {
-        logger.warning("🔑 ⚠️ VoIP push token invalidated for type: \(type)")
-        cachedToken = nil
-        if let tokenListener = tokenListener {
-            logger.info("🔑 Notifying listener about token invalidation")
-            tokenListener("")
-        }
+        manager?.handleTokenInvalidation()
     }
 }

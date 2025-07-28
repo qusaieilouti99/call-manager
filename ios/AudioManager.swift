@@ -7,16 +7,16 @@ protocol AudioManagerDelegate: AnyObject {
     func audioManager(_ manager: AudioManager, didChangeDevices routeInfo: AudioRoutesInfo)
 }
 
-class AudioManager: NSObject {
+class AudioManager {
     private let logger = Logger(subsystem: "com.qusaieilouti99.callmanager", category: "AudioManager")
     private weak var delegate: AudioManagerDelegate?
     private var audioSession: AVAudioSession
     private var lastRouteInfo: AudioRoutesInfo?
+    private var notificationObservers: [NSObjectProtocol] = []
 
     init(delegate: AudioManagerDelegate) {
         self.delegate = delegate
         self.audioSession = AVAudioSession.sharedInstance()
-        super.init()
 
         logger.info("🔊 AudioManager initializing...")
         setupNotifications()
@@ -25,31 +25,36 @@ class AudioManager: NSObject {
 
     deinit {
         logger.info("🔊 AudioManager deinitializing...")
-        NotificationCenter.default.removeObserver(self)
+        for observer in notificationObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        notificationObservers.removeAll()
     }
 
-    // MARK: - Setup
     private func setupNotifications() {
         logger.info("🔊 Setting up audio session notifications...")
 
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(audioRouteChanged),
-            name: AVAudioSession.routeChangeNotification,
-            object: nil
-        )
+        let routeChangeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            self?.handleAudioRouteChanged(notification: notification)
+        }
+        notificationObservers.append(routeChangeObserver)
 
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(audioSessionInterrupted),
-            name: AVAudioSession.interruptionNotification,
-            object: nil
-        )
+        let interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            self?.handleAudioSessionInterrupted(notification: notification)
+        }
+        notificationObservers.append(interruptionObserver)
 
         logger.info("🔊 ✅ Audio session notifications setup completed")
     }
 
-    // MARK: - Public Methods
     func configureForIncomingCall() {
         logger.info("🔊 Configuring audio session for incoming call...")
 
@@ -103,7 +108,6 @@ class AudioManager: NSObject {
         logger.debug("🔊 Current route inputs: \(currentRoute.inputs.map { $0.portType.rawValue })")
         logger.debug("🔊 Current route outputs: \(currentRoute.outputs.map { $0.portType.rawValue })")
 
-        // Check for available inputs/outputs
         if let availableInputs = audioSession.availableInputs {
             logger.debug("🔊 Available inputs: \(availableInputs.map { $0.portType.rawValue })")
 
@@ -126,7 +130,6 @@ class AudioManager: NSObject {
             }
         }
 
-        // Determine current route
         let currentRouteString = getCurrentAudioRoute()
 
         let routeInfo = AudioRoutesInfo(devices: devices, currentRoute: currentRouteString)
@@ -153,11 +156,9 @@ class AudioManager: NSObject {
             case "Bluetooth":
                 logger.debug("🔊 Setting to Bluetooth (system managed)...")
                 try audioSession.overrideOutputAudioPort(.none)
-                // Bluetooth routing is handled automatically by the system
             case "Headset":
                 logger.debug("🔊 Setting to Headset (system managed)...")
                 try audioSession.overrideOutputAudioPort(.none)
-                // Headset routing is handled automatically by the system
             default:
                 logger.warning("🔊 ⚠️ Unknown audio route: \(route)")
                 return
@@ -176,8 +177,6 @@ class AudioManager: NSObject {
 
     func setMuted(_ muted: Bool) {
         logger.info("🔊 Mute state changed to: \(muted)")
-        // Note: Muting is typically handled by CallKit automatically
-        // This is here for consistency with Android implementation
     }
 
     func cleanup() {
@@ -191,7 +190,6 @@ class AudioManager: NSObject {
         }
     }
 
-    // MARK: - Private Methods
     private func getCurrentAudioRoute() -> String {
         let currentRoute = audioSession.currentRoute
 
@@ -214,23 +212,22 @@ class AudioManager: NSObject {
         }
 
         logger.debug("🔊 No specific route found, defaulting to Earpiece")
-        return "Earpiece" // Default fallback
+        return "Earpiece"
     }
 
     private func notifyRouteChange() {
         logger.debug("🔊 Notifying delegate about route change...")
         let routeInfo = getAudioDevices()
-        delegate?.audioManager(self, didChangeRoute: routeInfo)
+        self.delegate?.audioManager(self, didChangeRoute: routeInfo)
     }
 
     private func notifyDeviceChange() {
         logger.debug("🔊 Notifying delegate about device change...")
         let routeInfo = getAudioDevices()
-        delegate?.audioManager(self, didChangeDevices: routeInfo)
+        self.delegate?.audioManager(self, didChangeDevices: routeInfo)
     }
 
-    // MARK: - Notification Handlers
-    @objc private func audioRouteChanged(notification: Notification) {
+    private func handleAudioRouteChanged(notification: Notification) {
         logger.info("🔊 Audio route changed notification received")
 
         guard let userInfo = notification.userInfo,
@@ -255,7 +252,7 @@ class AudioManager: NSObject {
         }
     }
 
-    @objc private func audioSessionInterrupted(notification: Notification) {
+    private func handleAudioSessionInterrupted(notification: Notification) {
         logger.info("🔊 Audio session interrupted notification received")
 
         guard let userInfo = notification.userInfo,
@@ -274,7 +271,6 @@ class AudioManager: NSObject {
                 let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
                 if options.contains(.shouldResume) {
                     logger.info("🔊 Should resume audio session")
-                    // Audio session will be reactivated by CallKit
                 }
             }
         @unknown default:

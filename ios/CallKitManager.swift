@@ -9,7 +9,7 @@ protocol CallKitManagerDelegate: AnyObject {
     func callKitManager(_ manager: CallKitManager, didSetMuted callId: String, muted: Bool)
 }
 
-class CallKitManager: NSObject {
+class CallKitManager {
     private let logger = Logger(subsystem: "com.qusaieilouti99.callmanager", category: "CallKitManager")
     private let provider: CXProvider
     private let callController = CXCallController()
@@ -30,7 +30,6 @@ class CallKitManager: NSObject {
         configuration.supportedHandleTypes = [.phoneNumber, .generic]
         configuration.includesCallsInRecents = true
 
-        // Audio configuration
         if let ringtonePath = Bundle.main.path(forResource: "ringtone", ofType: "caf") {
             configuration.ringtoneSoundURL = URL(fileURLWithPath: ringtonePath)
             logger.info("📲 Custom ringtone configured")
@@ -39,14 +38,10 @@ class CallKitManager: NSObject {
         }
 
         provider = CXProvider(configuration: configuration)
-
-        super.init()
-
-        provider.setDelegate(self, queue: nil)
+        provider.setDelegate(CallKitProviderDelegate(manager: self), queue: nil)
         logger.info("📲 ✅ CallKitManager initialized successfully")
     }
 
-    // MARK: - Public Methods
     func reportIncomingCall(callInfo: CallInfo, completion: @escaping (Error?) -> Void) {
         logger.info("📲 Reporting incoming call: \(callInfo.callId)")
 
@@ -68,15 +63,16 @@ class CallKitManager: NSObject {
 
         logger.info("📲 Call update configured: name=\(callInfo.displayName), hasVideo=\(update.hasVideo)")
 
-        activeCallIds.insert(callInfo.callId)
-        logger.info("📲 Added to active calls. Total active: \(activeCallIds.count)")
+        self.activeCallIds.insert(callInfo.callId)
+        logger.info("📲 Added to active calls. Total active: \(self.activeCallIds.count)")
 
         provider.reportNewIncomingCall(with: callUUID, update: update) { [weak self] error in
+            guard let self = self else { return }
             if let error = error {
-                self?.logger.error("📲 ❌ Failed to report incoming call: \(error.localizedDescription)")
-                self?.activeCallIds.remove(callInfo.callId)
+                self.logger.error("📲 ❌ Failed to report incoming call: \(error.localizedDescription)")
+                self.activeCallIds.remove(callInfo.callId)
             } else {
-                self?.logger.info("📲 ✅ Successfully reported incoming call: \(callInfo.callId)")
+                self.logger.info("📲 ✅ Successfully reported incoming call: \(callInfo.callId)")
             }
             completion(error)
         }
@@ -100,15 +96,16 @@ class CallKitManager: NSObject {
 
         let transaction = CXTransaction(action: startCallAction)
 
-        activeCallIds.insert(callInfo.callId)
-        logger.info("📲 Added to active calls. Total active: \(activeCallIds.count)")
+        self.activeCallIds.insert(callInfo.callId)
+        logger.info("📲 Added to active calls. Total active: \(self.activeCallIds.count)")
 
         callController.request(transaction) { [weak self] error in
+            guard let self = self else { return }
             if let error = error {
-                self?.logger.error("📲 ❌ Failed to start outgoing call: \(error.localizedDescription)")
-                self?.activeCallIds.remove(callInfo.callId)
+                self.logger.error("📲 ❌ Failed to start outgoing call: \(error.localizedDescription)")
+                self.activeCallIds.remove(callInfo.callId)
             } else {
-                self?.logger.info("📲 ✅ Successfully started outgoing call: \(callInfo.callId)")
+                self.logger.info("📲 ✅ Successfully started outgoing call: \(callInfo.callId)")
             }
             completion(error)
         }
@@ -118,7 +115,7 @@ class CallKitManager: NSObject {
         logger.info("📲 Ending call: \(callId)")
 
         guard let callUUID = UUID(uuidString: callId),
-              activeCallIds.contains(callId) else {
+              self.activeCallIds.contains(callId) else {
             logger.warning("📲 ⚠️ Cannot end call \(callId) - not found or invalid UUID")
             return
         }
@@ -127,11 +124,12 @@ class CallKitManager: NSObject {
         let transaction = CXTransaction(action: endCallAction)
 
         callController.request(transaction) { [weak self] error in
+            guard let self = self else { return }
             if let error = error {
-                self?.logger.error("📲 ❌ Failed to end call: \(error.localizedDescription)")
+                self.logger.error("📲 ❌ Failed to end call: \(error.localizedDescription)")
             } else {
-                self?.logger.info("📲 ✅ Successfully ended call: \(callId)")
-                self?.activeCallIds.remove(callId)
+                self.logger.info("📲 ✅ Successfully ended call: \(callId)")
+                self.activeCallIds.remove(callId)
             }
         }
     }
@@ -140,7 +138,7 @@ class CallKitManager: NSObject {
         logger.info("📲 Setting call \(callId) hold state to: \(onHold)")
 
         guard let callUUID = UUID(uuidString: callId),
-              activeCallIds.contains(callId) else {
+              self.activeCallIds.contains(callId) else {
             logger.warning("📲 ⚠️ Cannot set hold for call \(callId) - not found or invalid UUID")
             return
         }
@@ -149,10 +147,11 @@ class CallKitManager: NSObject {
         let transaction = CXTransaction(action: holdAction)
 
         callController.request(transaction) { [weak self] error in
+            guard let self = self else { return }
             if let error = error {
-                self?.logger.error("📲 ❌ Failed to set call on hold: \(error.localizedDescription)")
+                self.logger.error("📲 ❌ Failed to set call on hold: \(error.localizedDescription)")
             } else {
-                self?.logger.info("📲 ✅ Successfully set call \(callId) hold state to: \(onHold)")
+                self.logger.info("📲 ✅ Successfully set call \(callId) hold state to: \(onHold)")
             }
         }
     }
@@ -161,7 +160,7 @@ class CallKitManager: NSObject {
         logger.info("📲 Updating call \(callId) display name to: \(displayName)")
 
         guard let callUUID = UUID(uuidString: callId),
-              activeCallIds.contains(callId) else {
+              self.activeCallIds.contains(callId) else {
             logger.warning("📲 ⚠️ Cannot update call \(callId) - not found or invalid UUID")
             return
         }
@@ -173,66 +172,97 @@ class CallKitManager: NSObject {
         provider.reportCall(with: callUUID, updated: update)
         logger.info("📲 ✅ Updated call \(callId) display name to: \(displayName)")
     }
-}
 
-// MARK: - CXProviderDelegate
-extension CallKitManager: CXProviderDelegate {
-    func providerDidReset(_ provider: CXProvider) {
+    fileprivate func handleProviderReset() {
         logger.info("📲 🔄 Provider did reset - clearing all active calls")
-        activeCallIds.removeAll()
+        self.activeCallIds.removeAll()
     }
 
-    func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+    fileprivate func handleAnswerCall(callId: String) {
         logger.info("📲 📞 Provider perform answer call action")
-        let callId = action.callUUID.uuidString
         logger.info("📲 Answering call: \(callId)")
-        delegate?.callKitManager(self, didAnswerCall: callId)
-        action.fulfill()
-        logger.info("📲 ✅ Answer action fulfilled")
+        self.delegate?.callKitManager(self, didAnswerCall: callId)
     }
 
-    func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
+    fileprivate func handleEndCall(callId: String) {
         logger.info("📲 📞 Provider perform end call action")
-        let callId = action.callUUID.uuidString
         logger.info("📲 Ending call: \(callId)")
-        activeCallIds.remove(callId)
-        delegate?.callKitManager(self, didEndCall: callId)
-        action.fulfill()
-        logger.info("📲 ✅ End call action fulfilled")
+        self.activeCallIds.remove(callId)
+        self.delegate?.callKitManager(self, didEndCall: callId)
     }
 
-    func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {
-        logger.info("📲 📞 Provider perform set held call action: \(action.isOnHold)")
-        let callId = action.callUUID.uuidString
-        logger.info("📲 Setting call \(callId) hold state to: \(action.isOnHold)")
-        delegate?.callKitManager(self, didSetHeld: callId, onHold: action.isOnHold)
-        action.fulfill()
-        logger.info("📲 ✅ Set held action fulfilled")
+    fileprivate func handleSetHeld(callId: String, onHold: Bool) {
+        logger.info("📲 📞 Provider perform set held call action: \(onHold)")
+        logger.info("📲 Setting call \(callId) hold state to: \(onHold)")
+        self.delegate?.callKitManager(self, didSetHeld: callId, onHold: onHold)
     }
 
-    func provider(_ provider: CXProvider, perform action: CXSetMutedCallAction) {
-        logger.info("📲 📞 Provider perform set muted call action: \(action.isMuted)")
-        let callId = action.callUUID.uuidString
-        logger.info("📲 Setting call \(callId) mute state to: \(action.isMuted)")
-        delegate?.callKitManager(self, didSetMuted: callId, muted: action.isMuted)
-        action.fulfill()
-        logger.info("📲 ✅ Set muted action fulfilled")
+    fileprivate func handleSetMuted(callId: String, muted: Bool) {
+        logger.info("📲 📞 Provider perform set muted call action: \(muted)")
+        logger.info("📲 Setting call \(callId) mute state to: \(muted)")
+        self.delegate?.callKitManager(self, didSetMuted: callId, muted: muted)
     }
 
-    func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
+    fileprivate func handleStartCall() {
         logger.info("📲 📞 Provider perform start call action")
-        logger.info("📲 Starting outgoing call with handle: \(action.handle.value)")
-        action.fulfill()
         logger.info("📲 ✅ Start call action fulfilled")
     }
 
-    func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+    fileprivate func handleAudioSessionActivated() {
         logger.info("📲 🔊 Provider did activate audio session")
-        logger.info("📲 Audio session category: \(audioSession.category.rawValue)")
-        logger.info("📲 Audio session mode: \(audioSession.mode.rawValue)")
+    }
+
+    fileprivate func handleAudioSessionDeactivated() {
+        logger.info("📲 🔊 Provider did deactivate audio session")
+    }
+}
+
+private class CallKitProviderDelegate: NSObject, CXProviderDelegate {
+    private weak var manager: CallKitManager?
+
+    init(manager: CallKitManager) {
+        self.manager = manager
+        super.init()
+    }
+
+    func providerDidReset(_ provider: CXProvider) {
+        manager?.handleProviderReset()
+    }
+
+    func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+        let callId = action.callUUID.uuidString
+        manager?.handleAnswerCall(callId: callId)
+        action.fulfill()
+    }
+
+    func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
+        let callId = action.callUUID.uuidString
+        manager?.handleEndCall(callId: callId)
+        action.fulfill()
+    }
+
+    func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {
+        let callId = action.callUUID.uuidString
+        manager?.handleSetHeld(callId: callId, onHold: action.isOnHold)
+        action.fulfill()
+    }
+
+    func provider(_ provider: CXProvider, perform action: CXSetMutedCallAction) {
+        let callId = action.callUUID.uuidString
+        manager?.handleSetMuted(callId: callId, muted: action.isMuted)
+        action.fulfill()
+    }
+
+    func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
+        manager?.handleStartCall()
+        action.fulfill()
+    }
+
+    func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+        manager?.handleAudioSessionActivated()
     }
 
     func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
-        logger.info("📲 🔊 Provider did deactivate audio session")
+        manager?.handleAudioSessionDeactivated()
     }
 }

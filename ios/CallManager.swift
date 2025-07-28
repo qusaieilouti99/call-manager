@@ -17,7 +17,6 @@ public class CallManager: HybridCallManagerSpec {
         CallEngine.shared.initialize()
     }
 
-    // MARK: - HybridCallManagerSpec Implementation
     public func endCall(callId: String) throws {
         logger.info("🎯📞 endCall requested for callId: \(callId)")
         ensureInitialized()
@@ -35,7 +34,6 @@ public class CallManager: HybridCallManagerSpec {
     public func silenceRingtone() throws {
         logger.info("🎯🔇 silenceRingtone requested")
         ensureInitialized()
-        // Ringtone silencing is handled by CallKit automatically in iOS
         logger.info("🎯🔇 ✅ silenceRingtone completed (handled by CallKit)")
     }
 
@@ -57,7 +55,6 @@ public class CallManager: HybridCallManagerSpec {
     public func keepScreenAwake(keepAwake: Bool) throws {
         logger.info("🎯💡 keepScreenAwake requested: \(keepAwake)")
         ensureInitialized()
-        // Screen wake management is handled by CallKit automatically
         logger.info("🎯💡 ✅ keepScreenAwake completed (handled by CallKit)")
     }
 
@@ -65,17 +62,17 @@ public class CallManager: HybridCallManagerSpec {
         logger.info("🎯📡 addListener called")
         ensureInitialized()
 
-        CallEngine.shared.setEventHandler { eventType, payload in
-            self.logger.debug("🎯📡 Event emitted: \(eventType), payload length: \(payload.count)")
+        CallEngine.shared.setEventHandler { [weak self] eventType, payload in
+            self?.logger.debug("🎯📡 Event emitted: \(eventType), payload length: \(payload.count)")
             listener(eventType, payload)
         }
 
         logger.info("🎯📡 ✅ Event handler registered")
 
-        return {
-            self.logger.info("🎯📡 Removing event handler...")
+        return { [weak self] in
+            self?.logger.info("🎯📡 Removing event handler...")
             CallEngine.shared.setEventHandler(nil)
-            self.logger.info("🎯📡 ✅ Event handler removed")
+            self?.logger.info("🎯📡 ✅ Event handler removed")
         }
     }
 
@@ -131,17 +128,17 @@ public class CallManager: HybridCallManagerSpec {
         logger.info("🎯🔑 registerVoIPTokenListener called")
         ensureInitialized()
 
-        VoIPTokenManager.shared.registerTokenListener { token in
-            self.logger.info("🎯🔑 VoIP token received, length: \(token.count)")
+        VoIPTokenManager.shared.registerTokenListener { [weak self] token in
+            self?.logger.info("🎯🔑 VoIP token received, length: \(token.count)")
             listener(token)
         }
 
         logger.info("🎯🔑 ✅ VoIP token listener registered")
 
-        return {
-            self.logger.info("🎯🔑 Removing VoIP token listener...")
+        return { [weak self] in
+            self?.logger.info("🎯🔑 Removing VoIP token listener...")
             VoIPTokenManager.shared.unregisterTokenListener()
-            self.logger.info("🎯🔑 ✅ VoIP token listener removed")
+            self?.logger.info("🎯🔑 ✅ VoIP token listener removed")
         }
     }
 }
