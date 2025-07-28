@@ -1,6 +1,6 @@
 {
   "name": "@qusaieilouti99/call-manager",
-  "version": "0.1.82",
+  "version": "0.1.83",
   "description": "Call manager",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",
@@ -91,7 +91,7 @@
   "peerDependencies": {
     "react": "*",
     "react-native": "*",
-    "react-native-nitro-modules": "^0.26.2"
+    "react-native-nitro-modules": "*"
   },
   "workspaces": [
     "example"
