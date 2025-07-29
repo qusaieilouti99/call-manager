@@ -102,7 +102,7 @@ class CallManager : HybridCallManagerSpec() {
         // do nothing for now
     }
 
-    override fun registerVoIPTokenListener(listener: (payload: String) -> Unit): () -> Unit
+    override fun registerVoIPTokenListener(listener: (payload: String) -> Unit): () -> Unit {
         Log.d(TAG, "registerVoIPTokenListener called")
         return {
             Log.d(TAG, "registerVoIPTokenListener removed.")
