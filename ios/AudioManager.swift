@@ -3,277 +3,166 @@ import AVFoundation
 import OSLog
 
 protocol AudioManagerDelegate: AnyObject {
-    func audioManager(_ manager: AudioManager, didChangeRoute routeInfo: AudioRoutesInfo)
-    func audioManager(_ manager: AudioManager, didChangeDevices routeInfo: AudioRoutesInfo)
-    func audioManagerDidActivateAudioSession(_ manager: AudioManager)
-    func audioManagerDidDeactivateAudioSession(_ manager: AudioManager)
+  func audioManager(_ manager: AudioManager,
+                    didChangeRoute routeInfo: AudioRoutesInfo)
+  func audioManager(_ manager: AudioManager,
+                    didChangeDevices routeInfo: AudioRoutesInfo)
+  func audioManagerDidActivateAudioSession(_ manager: AudioManager)
+  func audioManagerDidDeactivateAudioSession(_ manager: AudioManager)
 }
 
 class AudioManager {
-    private let logger = Logger(subsystem: "com.qusaieilouti99.callmanager", category: "AudioManager")
-    private weak var delegate: AudioManagerDelegate?
-    private var audioSession: AVAudioSession
-    private var lastRouteInfo: AudioRoutesInfo?
-    private var notificationObservers: [NSObjectProtocol] = []
+  private let logger = Logger(subsystem: "com.qusaieilouti99.callmanager",
+                              category: "CallManager")
+  private weak var delegate: AudioManagerDelegate?
+  private let session = AVAudioSession.sharedInstance()
+  private var observers: [NSObjectProtocol] = []
 
-    init(delegate: AudioManagerDelegate) {
-        self.delegate = delegate
-        self.audioSession = AVAudioSession.sharedInstance()
+  init(delegate: AudioManagerDelegate) {
+    self.delegate = delegate
+    logger.info("AudioManager init")
+    setupNotifications()
+  }
 
-        logger.info("🔊 AudioManager initializing...")
-        setupNotifications()
-        logger.info("🔊 ✅ AudioManager initialized successfully")
+  deinit {
+    observers.forEach { NotificationCenter.default.removeObserver($0) }
+  }
+
+  private func setupNotifications() {
+    let nc = NotificationCenter.default
+    observers.append(
+      nc.addObserver(
+        forName: AVAudioSession.routeChangeNotification,
+        object: nil,
+        queue: nil
+      ) { [weak self] n in self?.handleRouteChange(n) }
+    )
+    observers.append(
+      nc.addObserver(
+        forName: AVAudioSession.interruptionNotification,
+        object: nil,
+        queue: nil
+      ) { [weak self] n in self?.handleInterruption(n) }
+    )
+    logger.info("AudioManager notifications set")
+  }
+
+  func configureAudioSession(forCallType isVideo: Bool,
+                             isIncoming: Bool) {
+    logger.info("configureAudioSession: video=\(isVideo), incoming=\(isIncoming)")
+    var opts: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP]
+    if isVideo || isIncoming { opts.insert(.defaultToSpeaker) }
+    do {
+      try session.setCategory(.playAndRecord,
+                              mode: .voiceChat,
+                              options: opts)
+      logger.info("audioSession category set")
+    } catch {
+      logger.error("setCategory failed: \(error.localizedDescription)")
     }
+  }
 
-    deinit {
-        logger.info("🔊 AudioManager deinitializing...")
-        for observer in notificationObservers {
-            NotificationCenter.default.removeObserver(observer)
-        }
-        notificationObservers.removeAll()
+  func activateAudioSession() {
+    logger.info("activateAudioSession")
+    do {
+      try session.setActive(true)
+      delegate?.audioManagerDidActivateAudioSession(self)
+    } catch {
+      logger.error("activate failed: \(error.localizedDescription)")
     }
+  }
 
-    private func setupNotifications() {
-        logger.info("🔊 Setting up audio session notifications...")
-
-        let routeChangeObserver = NotificationCenter.default.addObserver(
-            forName: AVAudioSession.routeChangeNotification,
-            object: nil,
-            queue: nil
-        ) { [weak self] notification in
-            self?.handleAudioRouteChanged(notification: notification)
-        }
-        notificationObservers.append(routeChangeObserver)
-
-        let interruptionObserver = NotificationCenter.default.addObserver(
-            forName: AVAudioSession.interruptionNotification,
-            object: nil,
-            queue: nil
-        ) { [weak self] notification in
-            self?.handleAudioSessionInterrupted(notification: notification)
-        }
-        notificationObservers.append(interruptionObserver)
-
-        logger.info("🔊 ✅ Audio session notifications setup completed")
+  func deactivateAudioSession() {
+    logger.info("deactivateAudioSession")
+    do {
+      try session.setActive(false, options: .notifyOthersOnDeactivation)
+      delegate?.audioManagerDidDeactivateAudioSession(self)
+    } catch {
+      logger.error("deactivate failed: \(error.localizedDescription)")
     }
+  }
 
-    // MARK: - Audio Session Configuration for CallKit
-
-    func configureAudioSession(forCallType isVideo: Bool, isIncoming: Bool) {
-        logger.info("🔊 Configuring audio session: isVideo=\(isVideo), isIncoming=\(isIncoming)...")
-
-        let options: AVAudioSession.CategoryOptions
-        if isVideo {
-            options = [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker]
-        } else {
-            options = [.allowBluetooth, .allowBluetoothA2DP]
+  func getAudioDevices() -> AudioRoutesInfo {
+    let current = session.currentRoute
+    var devices = ["Earpiece", "Speaker"]
+    if let inputs = session.availableInputs {
+      for i in inputs {
+        switch i.portType {
+        case .bluetoothHFP, .bluetoothA2DP, .bluetoothLE:
+          if !devices.contains("Bluetooth") { devices.append("Bluetooth") }
+        case .headphones, .headsetMic:
+          if !devices.contains("Headset") { devices.append("Headset") }
+        default: break
         }
-
-        do {
-            try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: options)
-            logger.info("🔊 ✅ Audio session category/mode/options set for call")
-        } catch {
-            logger.error("🔊 ❌ Failed to configure audio session: \(error.localizedDescription)")
-        }
+      }
     }
+    let route = determineCurrentRoute()
+    let info = AudioRoutesInfo(devices: devices, currentRoute: route)
+    return info
+  }
 
-    // MARK: - Audio Route Management
-
-    func getAudioDevices() -> AudioRoutesInfo {
-        logger.debug("🔊 Getting available audio devices...")
-
-        let currentRoute = audioSession.currentRoute
-        var devices: [String] = ["Earpiece", "Speaker"] // Default options
-
-        logger.debug("🔊 Current route inputs: \(currentRoute.inputs.map { $0.portType.rawValue })")
-        logger.debug("🔊 Current route outputs: \(currentRoute.outputs.map { $0.portType.rawValue })")
-
-        if let availableInputs = audioSession.availableInputs {
-            logger.debug("🔊 Available inputs: \(availableInputs.map { $0.portType.rawValue })")
-
-            for input in availableInputs {
-                switch input.portType {
-                case .bluetoothHFP, .bluetoothA2DP, .bluetoothLE:
-                    if !devices.contains("Bluetooth") {
-                        devices.append("Bluetooth")
-                        logger.debug("🔊 Added Bluetooth device")
-                    }
-                case .headphones, .headsetMic:
-                    if !devices.contains("Headset") {
-                        devices.append("Headset")
-                        logger.debug("🔊 Added Headset device")
-                    }
-                default:
-                    logger.debug("🔊 Other input type: \(input.portType.rawValue)")
-                    break
-                }
-            }
-        }
-
-        let currentRouteString = getCurrentAudioRoute()
-
-        let routeInfo = AudioRoutesInfo(devices: devices, currentRoute: currentRouteString)
-        lastRouteInfo = routeInfo
-
-        logger.info("🔊 Available audio devices: \(devices), current: \(currentRouteString)")
-        return routeInfo
+  func setAudioRoute(_ route: String) {
+    logger.info("setAudioRoute: \(route)")
+    do {
+      switch route {
+      case "Speaker":
+        try session.overrideOutputAudioPort(.speaker)
+      default:
+        try session.overrideOutputAudioPort(.none)
+      }
+    } catch {
+      logger.error("overrideOutputAudioPort failed: \(error.localizedDescription)")
     }
+  }
 
-    func setAudioRoute(_ route: String) {
-        logger.info("🔊 Setting audio route to: \(route)")
-
-        let previousRoute = getCurrentAudioRoute()
-        logger.debug("🔊 Previous route: \(previousRoute)")
-
-        do {
-            switch route {
-            case "Speaker":
-                logger.debug("🔊 Overriding to speaker...")
-                try audioSession.overrideOutputAudioPort(.speaker)
-            case "Earpiece":
-                logger.debug("🔊 Overriding to earpiece (built-in receiver)...")
-                try audioSession.overrideOutputAudioPort(.none)
-            case "Bluetooth", "Headset":
-                logger.debug("🔊 Setting to Bluetooth/Headset (system managed via .none)...")
-                try audioSession.overrideOutputAudioPort(.none)
-            default:
-                logger.warning("🔊 ⚠️ Unknown audio route: \(route)")
-                return
-            }
-
-            let newRoute = getCurrentAudioRoute()
-            logger.info("🔊 Audio route changed: \(previousRoute) → \(newRoute)")
-
-            if previousRoute != newRoute {
-                notifyRouteChange()
-            }
-        } catch {
-            logger.error("🔊 ❌ Failed to set audio route to \(route): \(error.localizedDescription)")
-        }
-    }
-
-    func setMuted(_ muted: Bool) {
-        logger.info("🔊 Mute state changed to: \(muted)")
-    }
-
-    // MARK: - Audio Session Activation/Deactivation from CallKit
-
-    func activateAudioSession() {
-        logger.info("🔊 Audio session activation requested by CallKit...")
-        do {
-            try audioSession.setActive(true)
-            logger.info("🔊 ✅ Audio session activated successfully")
-            delegate?.audioManagerDidActivateAudioSession(self)
-        } catch {
-            logger.error("🔊 ❌ Failed to activate audio session: \(error.localizedDescription)")
-        }
-    }
-
-    func deactivateAudioSession() {
-        logger.info("🔊 Audio session deactivation requested by CallKit...")
-        do {
-            try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-            logger.info("🔊 ✅ Audio session deactivated successfully")
-            delegate?.audioManagerDidDeactivateAudioSession(self)
-        } catch {
-            logger.error("🔊 ❌ Failed to deactivate audio session: \(error.localizedDescription)")
-        }
-    }
-
-    // MARK: - Internal Helper Methods
-
-    private func getCurrentAudioRoute() -> String {
-        let currentRoute = audioSession.currentRoute
-
-        for output in currentRoute.outputs {
-            let routeType = output.portType
-            logger.debug("🔊 Checking output port: \(routeType.rawValue)")
-
-            switch routeType {
-            case .bluetoothHFP, .bluetoothA2DP, .bluetoothLE:
-                return "Bluetooth"
-            case .builtInSpeaker:
-                return "Speaker"
-            case .headphones, .headsetMic:
-                return "Headset"
-            case .builtInReceiver:
-                return "Earpiece"
-            default:
-                logger.debug("🔊 Unhandled output type: \(routeType.rawValue)")
-                continue
-            }
-        }
-
-        logger.debug("🔊 No specific route found, defaulting to Earpiece")
+  private func determineCurrentRoute() -> String {
+    for o in session.currentRoute.outputs {
+      switch o.portType {
+      case .bluetoothHFP, .bluetoothA2DP, .bluetoothLE:
+        return "Bluetooth"
+      case .builtInSpeaker:
+        return "Speaker"
+      case .builtInReceiver:
         return "Earpiece"
+      case .headphones, .headsetMic:
+        return "Headset"
+      default: continue
+      }
     }
+    return "Earpiece"
+  }
 
-    private func notifyRouteChange() {
-        logger.debug("🔊 Notifying delegate about route change...")
-        let routeInfo = getAudioDevices()
-        self.delegate?.audioManager(self, didChangeRoute: routeInfo)
+  private func handleRouteChange(_ n: Notification) {
+    logger.info("routeChange notification")
+    guard let rv = n.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+          let reason = AVAudioSession.RouteChangeReason(rawValue: rv)
+    else { return }
+    let info = getAudioDevices()
+    switch reason {
+    case .newDeviceAvailable, .oldDeviceUnavailable:
+      delegate?.audioManager(self, didChangeDevices: info)
+    default:
+      delegate?.audioManager(self, didChangeRoute: info)
     }
+  }
 
-    private func notifyDeviceChange() {
-        logger.debug("🔊 Notifying delegate about device change...")
-        let routeInfo = getAudioDevices()
-        self.delegate?.audioManager(self, didChangeDevices: routeInfo)
-    }
-
-    // MARK: - Notification Handlers
-
-    private func handleAudioRouteChanged(notification: Notification) {
-        logger.info("🔊 Audio route changed notification received")
-
-        guard let userInfo = notification.userInfo,
-              let reasonValue = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
-              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else {
-            logger.warning("🔊 ⚠️ Could not parse route change reason")
-            return
+  private func handleInterruption(_ n: Notification) {
+    logger.info("interruption notification")
+    guard let tv = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+          let type = AVAudioSession.InterruptionType(rawValue: tv)
+    else { return }
+    switch type {
+    case .began:
+      logger.info("interruption began")
+    case .ended:
+      logger.info("interruption ended")
+      if let ov = n.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt {
+        let opts = AVAudioSession.InterruptionOptions(rawValue: ov)
+        if opts.contains(.shouldResume) {
+          activateAudioSession()
         }
-
-        logger.info("🔊 Route change reason: \(reason.rawValue)")
-
-        switch reason {
-        case AVAudioSession.RouteChangeReason.newDeviceAvailable, AVAudioSession.RouteChangeReason.oldDeviceUnavailable:
-            logger.info("🔊 Audio device availability changed: \(reason.rawValue)") // Use .rawValue
-            notifyDeviceChange()
-        case AVAudioSession.RouteChangeReason.override, AVAudioSession.RouteChangeReason.categoryChange:
-            logger.info("🔊 Audio route override or category change: \(reason.rawValue)") // Use .rawValue
-            notifyRouteChange()
-        case AVAudioSession.RouteChangeReason.wakeFromSleep, AVAudioSession.RouteChangeReason.noSuitableRouteForCategory:
-            logger.info("🔊 Session recovered or no suitable route: \(reason.rawValue)") // Use .rawValue
-            notifyRouteChange()
-        default:
-            logger.info("🔊 Other audio route change reason: \(reason.rawValue)") // Use .rawValue
-            notifyRouteChange()
-        }
+      }
+    @unknown default: break
     }
-
-    private func handleAudioSessionInterrupted(notification: Notification) {
-        logger.info("🔊 Audio session interrupted notification received")
-
-        guard let userInfo = notification.userInfo,
-              let interruptionTypeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
-              let interruptionType = AVAudioSession.InterruptionType(rawValue: interruptionTypeValue) else {
-            logger.warning("🔊 ⚠️ Could not parse interruption type")
-            return
-        }
-
-        switch interruptionType {
-        case .began:
-            logger.info("🔊 Audio session interruption began")
-        case .ended:
-            logger.info("🔊 Audio session interruption ended")
-            if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
-                let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
-                if options.contains(.shouldResume) {
-                    logger.info("🔊 Should resume audio session")
-                }
-            }
-        @unknown default:
-            logger.warning("🔊 ⚠️ Unknown interruption type")
-            break
-        }
-    }
+  }
 }
