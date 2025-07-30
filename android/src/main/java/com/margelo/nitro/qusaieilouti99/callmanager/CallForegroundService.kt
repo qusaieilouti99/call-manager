@@ -41,7 +41,7 @@ class CallForegroundService : Service() {
         }
 
         startForeground(NOTIFICATION_ID, notification)
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -155,6 +155,9 @@ class CallForegroundService : Service() {
         if (removed != CallActivity::class.java.name) {
             Log.d(TAG, "Main app task removed - terminating")
             CallEngine.onApplicationTerminate()
+
+            // Force kill the process (nuclear option)
+            android.os.Process.killProcess(android.os.Process.myPid())
         }
 
         super.onTaskRemoved(rootIntent)
