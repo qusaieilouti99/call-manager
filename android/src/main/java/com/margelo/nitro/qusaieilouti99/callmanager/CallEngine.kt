@@ -2,8 +2,6 @@
 package com.margelo.nitro.qusaieilouti99.callmanager
 
 import android.app.ActivityManager
-import android.app.Activity
-import android.app.Application
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -24,23 +22,27 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
-import android.telecom.CallAudioState
 import android.telecom.Connection
 import android.telecom.DisconnectCause
 import android.telecom.PhoneAccount
 import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
-import android.telecom.VideoProfile
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
+import android.app.KeyguardManager
+import android.os.Vibrator
+import android.os.VibrationEffect
 
 /**
- * Core call‐management engine.  Manages self-managed telecom calls,
+ * Core call‐management engine. Manages self-managed telecom calls,
  * audio routing, UI notifications, etc.
+ *
+ * NOTE: Volume key silencing is now handled by the system via `Connection.onSilence()`,
+ * which calls `silenceIncomingCall()` on this object.
  */
 object CallEngine {
   private const val TAG = "CallEngine"
@@ -48,57 +50,40 @@ object CallEngine {
   private const val NOTIF_CHANNEL_ID = "incoming_call_channel"
   private const val NOTIF_ID = 2001
 
-  // --- NEW: Call-end listener API ---
-  /**
-   * Implement this in your UI (CallActivity).  Will be called
-   * on the main thread whenever a call is ended.
-   */
   interface CallEndListener {
     fun onCallEnded(callId: String)
   }
 
-  // Thread-safe listener list + main-thread poster
   private val callEndListeners = CopyOnWriteArrayList<CallEndListener>()
   private val mainHandler = Handler(Looper.getMainLooper())
 
-  /** UI (e.g. CallActivity) should call this in onCreate() */
   fun registerCallEndListener(l: CallEndListener) {
     callEndListeners.add(l)
   }
 
-  /** UI (e.g. CallActivity) should call this in onDestroy() */
   fun unregisterCallEndListener(l: CallEndListener) {
     callEndListeners.remove(l)
   }
-  // --- end listener API ---
 
-  // Core context - initialized once and maintained
   @Volatile private var appContext: Context? = null
   private val isInitialized = AtomicBoolean(false)
   private val initializationLock = Any()
 
-  // Simplified Audio & Media Management (NO MANUAL AUDIO FOCUS)
   private var ringtone: android.media.Ringtone? = null
   private var ringbackPlayer: MediaPlayer? = null
+  private var vibrator: Vibrator? = null
   private var audioManager: AudioManager? = null
   private var wakeLock: PowerManager.WakeLock? = null
 
-  // Call State Management
   private val activeCalls = ConcurrentHashMap<String, CallInfo>()
   private val telecomConnections = ConcurrentHashMap<String, Connection>()
   private val callMetadata = ConcurrentHashMap<String, String>()
 
   private var currentCallId: String? = null
   private var canMakeMultipleCalls: Boolean = false
-
-  // Audio State Tracking
   private var lastAudioRoutesInfo: AudioRoutesInfo? = null
-
-  // Lock Screen Bypass
   private var lockScreenBypassActive = false
   private val lockScreenBypassCallbacks = mutableSetOf<LockScreenBypassCallback>()
-
-  // Event System
   private var eventHandler: ((CallEventType, String) -> Unit)? = null
   private val cachedEvents = mutableListOf<Pair<CallEventType, String>>()
 
@@ -106,14 +91,12 @@ object CallEngine {
     fun onLockScreenBypassChanged(shouldBypass: Boolean)
   }
 
-  // --- INITIALIZATION ---
   fun initialize(context: Context) {
     synchronized(initializationLock) {
       if (isInitialized.compareAndSet(false, true)) {
         appContext = context.applicationContext
         audioManager = appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         Log.d(TAG, "CallEngine initialized successfully")
-
         if (isCallActive()) {
           startForegroundService()
         }
@@ -129,7 +112,6 @@ object CallEngine {
     )
   }
 
-  // --- Event System ---
   fun setEventHandler(handler: ((CallEventType, String) -> Unit)?) {
     Log.d(TAG, "setEventHandler called. Handler present: ${handler != null}")
     eventHandler = handler
@@ -153,7 +135,15 @@ object CallEngine {
     }
   }
 
-  // --- Lock Screen Bypass Management ---
+  /**
+   * Silences the incoming call ringtone. This is called by `Connection.onSilence()`
+   * when the user presses a volume key during ringing.
+   */
+  fun silenceIncomingCall() {
+    Log.d(TAG, "Silencing incoming call ringtone via Connection.onSilence()")
+    stopRingtone()
+  }
+
   fun registerLockScreenBypassCallback(callback: LockScreenBypassCallback) {
     lockScreenBypassCallbacks.add(callback)
   }
@@ -179,21 +169,18 @@ object CallEngine {
 
   fun isLockScreenBypassActive(): Boolean = lockScreenBypassActive
 
-  // --- Telecom Connection Management ---
   fun addTelecomConnection(callId: String, connection: Connection) {
     telecomConnections[callId] = connection
     Log.d(TAG, "Added Telecom Connection for callId: $callId")
   }
 
   fun removeTelecomConnection(callId: String) {
-    telecomConnections.remove(callId)?.let {
-      Log.d(TAG, "Removed Telecom Connection for callId: $callId")
-    }
+    telecomConnections.remove(callId)
+    Log.d(TAG, "Removed Telecom Connection for callId: $callId")
   }
 
   fun getTelecomConnection(callId: String): Connection? = telecomConnections[callId]
 
-  // --- Public API ---
   fun setCanMakeMultipleCalls(allow: Boolean) {
     canMakeMultipleCalls = allow
     Log.d(TAG, "canMakeMultipleCalls set to: $allow")
@@ -208,7 +195,6 @@ object CallEngine {
     return jsonArray.toString()
   }
 
-  // --- Incoming Call Management ---
   fun reportIncomingCall(
     context: Context,
     callId: String,
@@ -224,7 +210,6 @@ object CallEngine {
     Log.d(TAG, "reportIncomingCall: callId=$callId, type=$callType, name=$displayName")
     metadata?.let { callMetadata[callId] = it }
 
-    // Check for call collision
     val incomingCall = activeCalls.values.find { it.state == CallState.INCOMING }
     if (incomingCall != null && incomingCall.callId != callId) {
       Log.d(TAG, "Incoming call collision detected. Auto-rejecting new call: $callId")
@@ -255,7 +240,7 @@ object CallEngine {
     currentCallId = callId
     Log.d(TAG, "Call $callId added to activeCalls. State: INCOMING")
 
-    showIncomingCallUI(callId, displayName, callType)
+    showIncomingCallUI(callId, displayName, callType, pictureUrl)
     registerPhoneAccount()
 
     val telecomManager =
@@ -281,7 +266,6 @@ object CallEngine {
     updateLockScreenBypass()
   }
 
-  // --- Outgoing Call Management ---
   fun startOutgoingCall(
     callId: String,
     callType: String,
@@ -342,7 +326,6 @@ object CallEngine {
       startRingback()
       bringAppToForeground()
       keepScreenAwake(true)
-      setInitialAudioRoute(callType)
       Log.d(TAG, "Successfully reported outgoing call to TelecomManager")
     } catch (e: Exception) {
       Log.e(TAG, "Failed to start outgoing call: ${e.message}", e)
@@ -390,7 +373,6 @@ object CallEngine {
     emitOutgoingCallAnsweredWithMetadata(callId)
   }
 
-  // --- Call Answer Management ---
   fun callAnsweredFromJS(callId: String) {
     Log.d(TAG, "callAnsweredFromJS: $callId - remote party answered")
     coreCallAnswered(callId, isLocalAnswer = false)
@@ -409,10 +391,9 @@ object CallEngine {
       return
     }
 
-    setAudioMode()
     activeCalls[callId] = callInfo.copy(state = CallState.ACTIVE)
     currentCallId = callId
-    Log.d(TAG, "Call $callId set to ACTIVE state (system manages audio focus)")
+    Log.d(TAG, "Call $callId set to ACTIVE state")
 
     stopRingtone()
     stopRingback()
@@ -430,6 +411,11 @@ object CallEngine {
     startForegroundService()
     keepScreenAwake(true)
     updateLockScreenBypass()
+
+    setAudioMode()
+    mainHandler.postDelayed({
+      setInitialAudioRoute(callInfo.callType)
+    }, 300L)
 
     if (isLocalAnswer) {
       emitCallAnsweredWithMetadata(callId)
@@ -478,7 +464,6 @@ object CallEngine {
     })
   }
 
-  // --- Call Control Methods ---
   fun holdCall(callId: String) {
     holdCallInternal(callId, heldBySystem = false)
   }
@@ -572,7 +557,6 @@ object CallEngine {
     }
   }
 
-  // --- Call End Management ---
   fun endCall(callId: String) {
     Log.d(TAG, "endCall: $callId")
     endCallInternal(callId)
@@ -604,7 +588,6 @@ object CallEngine {
     }
 
     val metadata = callMetadata.remove(callId)
-    activeCalls[callId] = callInfo.copy(state = CallState.ENDED)
     activeCalls.remove(callId)
 
     stopRingback()
@@ -624,25 +607,6 @@ object CallEngine {
     try {
       context.sendBroadcast(closeActivityIntent)
       Log.d(TAG, "Sent close broadcast for CallActivity: $callId")
-
-      Handler(Looper.getMainLooper()).postDelayed({
-        try {
-          context.sendBroadcast(closeActivityIntent)
-          Log.d(TAG, "Sent delayed close broadcast (100ms) for CallActivity: $callId")
-        } catch (e: Exception) {
-          Log.w(TAG, "Failed to send delayed close broadcast (100ms): ${e.message}")
-        }
-      }, 100L)
-
-      Handler(Looper.getMainLooper()).postDelayed({
-        try {
-          context.sendBroadcast(closeActivityIntent)
-          Log.d(TAG, "Sent delayed close broadcast (500ms) for CallActivity: $callId")
-        } catch (e: Exception) {
-          Log.w(TAG, "Failed to send delayed close broadcast (500ms): ${e.message}")
-        }
-      }, 500L)
-
     } catch (e: Exception) {
       Log.w(TAG, "Failed to send close broadcast: ${e.message}")
     }
@@ -661,7 +625,6 @@ object CallEngine {
 
     updateLockScreenBypass()
 
-    // --- NEW: notify all registered CallEndListeners on main thread ---
     for (listener in callEndListeners) {
       mainHandler.post {
         try {
@@ -672,7 +635,6 @@ object CallEngine {
       }
     }
 
-    // Emit end event with metadata
     emitEvent(CallEventType.CALL_ENDED, JSONObject().apply {
       put("callId", callId)
       metadata?.let {
@@ -682,7 +644,6 @@ object CallEngine {
     })
   }
 
-  // --- Enhanced Audio Management ---
   fun getAudioDevices(): AudioRoutesInfo {
     val context = requireContext()
     audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
@@ -717,39 +678,59 @@ object CallEngine {
   }
 
   fun setAudioRoute(route: String) {
-    val context = requireContext()
-    audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    Log.d(TAG, "Setting audio route to: $route")
+    Log.d(TAG, "setAudioRoute called: $route")
 
-    val prev = getCurrentAudioRoute()
-    audioManager?.isSpeakerphoneOn = false
-    audioManager?.stopBluetoothSco()
-    audioManager?.isBluetoothScoOn = false
+    val ctx = requireContext()
+    if (audioManager == null) {
+      audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    }
+    val am = audioManager!!
+
+    if (am.mode != AudioManager.MODE_IN_COMMUNICATION) {
+      am.mode = AudioManager.MODE_IN_COMMUNICATION
+    }
 
     when (route) {
       "Speaker" -> {
-        audioManager?.isSpeakerphoneOn = true
-        audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
+        am.isSpeakerphoneOn = true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && am.isBluetoothScoOn) {
+          am.stopBluetoothSco()
+          am.isBluetoothScoOn = false
+        }
+        Log.d(TAG, "Audio routed to SPEAKER")
       }
       "Earpiece" -> {
-        audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
+        am.isSpeakerphoneOn = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && am.isBluetoothScoOn) {
+          am.stopBluetoothSco()
+          am.isBluetoothScoOn = false
+        }
+        Log.d(TAG, "Audio routed to EARPIECE")
       }
       "Bluetooth" -> {
-        audioManager?.startBluetoothSco()
-        audioManager?.isBluetoothScoOn = true
-        audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
+        am.isSpeakerphoneOn = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+          am.startBluetoothSco()
+          am.isBluetoothScoOn = true
+          Log.d(TAG, "Audio routed to BLUETOOTH")
+        } else {
+          Log.w(TAG, "Bluetooth SCO not supported on this OS version")
+        }
       }
       "Headset" -> {
-        audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
+        am.isSpeakerphoneOn = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && am.isBluetoothScoOn) {
+          am.stopBluetoothSco()
+          am.isBluetoothScoOn = false
+        }
+        Log.d(TAG, "Audio routed to HEADSET")
       }
       else -> {
         Log.w(TAG, "Unknown audio route: $route")
         return
       }
     }
-
-    val now = getCurrentAudioRoute()
-    if (prev != now) emitAudioRouteChanged()
+    emitAudioRouteChanged()
   }
 
   private fun getCurrentAudioRoute(): String {
@@ -769,7 +750,7 @@ object CallEngine {
       callType == "Video" -> "Speaker"
       else -> "Earpiece"
     }
-    Log.d(TAG, "Setting initial audio route: $defaultRoute")
+    Log.d(TAG, "Setting initial audio route: $defaultRoute for call type: $callType")
     setAudioRoute(defaultRoute)
   }
 
@@ -831,7 +812,6 @@ object CallEngine {
     audioManager?.unregisterAudioDeviceCallback(audioDeviceCallback)
   }
 
-  // --- Screen Management ---
   fun keepScreenAwake(keepAwake: Boolean) {
     val context = requireContext()
     val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -855,7 +835,6 @@ object CallEngine {
     }
   }
 
-  // --- Utility Methods ---
   fun getActiveCalls(): List<CallInfo> = activeCalls.values.toList()
   fun getCurrentCallId(): String? = currentCallId
   fun isCallActive(): Boolean = activeCalls.any {
@@ -879,7 +858,6 @@ object CallEngine {
     })
   }
 
-  // --- Notification Management ---
   private fun createNotificationChannel() {
     val context = requireContext()
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -892,7 +870,8 @@ object CallEngine {
       channel.enableLights(true)
       channel.lightColor = Color.GREEN
       channel.enableVibration(true)
-
+      channel.setBypassDnd(true)
+      channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
       if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
         channel.setSound(
           RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE),
@@ -905,18 +884,76 @@ object CallEngine {
         channel.setSound(null, null)
         channel.importance = NotificationManager.IMPORTANCE_HIGH
       }
-
       val manager = context.getSystemService(NotificationManager::class.java)
       manager.createNotificationChannel(channel)
     }
   }
 
-  private fun showIncomingCallUI(callId: String, callerName: String, callType: String) {
+  private fun showIncomingCallUI(callId: String, callerName: String, callType: String, callerPicUrl: String?) {
     val context = requireContext()
     Log.d(TAG, "Showing incoming call UI for $callId")
+
+    if (isDeviceLocked(context)) {
+      Log.d(TAG, "Device is locked - using overlay approach")
+      showCallActivityOverlay(context, callId, callerName, callType, callerPicUrl)
+    } else {
+      Log.d(TAG, "Device is unlocked - using standard notification")
+      showStandardNotification(context, callId, callerName, callType, callerPicUrl)
+    }
+    playRingtone()
+  }
+
+  private fun isDeviceLocked(context: Context): Boolean {
+    val keyguardManager = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+    return keyguardManager.isKeyguardLocked
+  }
+
+  private fun showCallActivityOverlay(context: Context, callId: String, callerName: String, callType: String, callerPicUrl: String?) {
+    val overlayIntent = Intent(context, CallActivity::class.java).apply {
+      addFlags(
+        Intent.FLAG_ACTIVITY_NEW_TASK or
+        Intent.FLAG_ACTIVITY_CLEAR_TASK or
+        Intent.FLAG_ACTIVITY_NO_ANIMATION or
+        Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+      )
+      putExtra("callId", callId)
+      putExtra("callerName", callerName)
+      putExtra("callType", callType)
+      callerPicUrl?.let { putExtra("callerAvatar", it) }
+      putExtra("LOCK_SCREEN_MODE", true)
+    }
+
+    try {
+      val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+      val wakeLock = powerManager.newWakeLock(
+        PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+        "CallEngine:LockScreenWake"
+      )
+      wakeLock.acquire(5000)
+      context.startActivity(overlayIntent)
+      Log.d(TAG, "Successfully launched CallActivity overlay for locked device")
+    } catch (e: Exception) {
+      Log.e(TAG, "Overlay failed, falling back to notification: ${e.message}")
+      showStandardNotification(context, callId, callerName, callType, callerPicUrl)
+    }
+  }
+
+  private fun showStandardNotification(context: Context, callId: String, callerName: String, callType: String, callerPicUrl: String?) {
     createNotificationChannel()
-    val notificationManager =
-      context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+    val fullScreenIntent = Intent(context, CallActivity::class.java).apply {
+      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+      putExtra("callId", callId)
+      putExtra("callerName", callerName)
+      putExtra("callType", callType)
+      callerPicUrl?.let { putExtra("callerAvatar", it) }
+    }
+
+    val fullScreenPendingIntent = PendingIntent.getActivity(
+      context, callId.hashCode(), fullScreenIntent,
+      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    )
 
     val answerIntent = Intent(context, CallNotificationActionReceiver::class.java).apply {
       action = "com.qusaieilouti99.callmanager.ANSWER_CALL"
@@ -933,17 +970,6 @@ object CallEngine {
     }
     val declinePendingIntent = PendingIntent.getBroadcast(
       context, 1, declineIntent,
-      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-    )
-
-    val fullScreenIntent = Intent(context, CallActivity::class.java).apply {
-      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-      putExtra("callId", callId)
-      putExtra("callerName", callerName)
-      putExtra("callType", callType)
-    }
-    val fullScreenPendingIntent = PendingIntent.getActivity(
-      context, 2, fullScreenIntent,
       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
     )
 
@@ -964,25 +990,27 @@ object CallEngine {
         .setFullScreenIntent(fullScreenPendingIntent, true)
         .setOngoing(true)
         .setAutoCancel(false)
+        .setCategory(Notification.CATEGORY_CALL)
+        .setPriority(Notification.PRIORITY_MAX)
+        .setVisibility(Notification.VISIBILITY_PUBLIC)
         .build()
     } else {
       Notification.Builder(context, NOTIF_CHANNEL_ID)
         .setSmallIcon(android.R.drawable.sym_call_incoming)
         .setContentTitle("Incoming Call")
         .setContentText(callerName)
-        .setPriority(Notification.PRIORITY_HIGH)
+        .setPriority(Notification.PRIORITY_MAX)
         .setCategory(Notification.CATEGORY_CALL)
         .setFullScreenIntent(fullScreenPendingIntent, true)
         .addAction(android.R.drawable.sym_action_call, "Answer", answerPendingIntent)
         .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Decline", declinePendingIntent)
         .setOngoing(true)
         .setAutoCancel(false)
+        .setVisibility(Notification.VISIBILITY_PUBLIC)
         .build()
     }
 
     notificationManager.notify(NOTIF_ID, notification)
-    playRingtone()
-    setInitialAudioRoute(callType)
   }
 
   fun cancelIncomingCallUI() {
@@ -993,7 +1021,6 @@ object CallEngine {
     stopRingtone()
   }
 
-  // --- Service Management ---
   private fun startForegroundService() {
     val context = requireContext()
     val currentCall = activeCalls.values.find {
@@ -1088,7 +1115,6 @@ object CallEngine {
     }
   }
 
-  // --- Phone Account Management ---
   private fun registerPhoneAccount() {
     val context = requireContext()
     val telecomManager =
@@ -1117,16 +1143,29 @@ object CallEngine {
     )
   }
 
-  // --- Media Management ---
   private fun playRingtone() {
     val context = requireContext()
+    audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    audioManager?.mode = AudioManager.MODE_RINGTONE
+
+    vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+    vibrator?.let { v ->
+      val pattern = longArrayOf(0L, 500L, 500L)
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        v.vibrate(VibrationEffect.createWaveform(pattern, 0))
+      } else {
+        @Suppress("DEPRECATION")
+        v.vibrate(pattern, 0)
+      }
+    }
+
     try {
       val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
       ringtone = RingtoneManager.getRingtone(context, uri)
       ringtone?.play()
       Log.d(TAG, "Ringtone started playing")
     } catch (e: Exception) {
-      Log.e(TAG, "Failed to play ringtone: ${e.message}", e)
+      Log.e(TAG, "Failed to play ringtone", e)
     }
   }
 
@@ -1135,9 +1174,12 @@ object CallEngine {
       ringtone?.stop()
       Log.d(TAG, "Ringtone stopped")
     } catch (e: Exception) {
-      Log.e(TAG, "Error stopping ringtone: ${e.message}")
+      Log.e(TAG, "Error stopping ringtone", e)
     }
     ringtone = null
+
+    vibrator?.cancel()
+    vibrator = null
   }
 
   private fun startRingback() {
@@ -1168,7 +1210,6 @@ object CallEngine {
     }
   }
 
-  // --- Cleanup ---
   private fun cleanup() {
     Log.d(TAG, "Performing cleanup")
     stopForegroundService()
@@ -1176,7 +1217,6 @@ object CallEngine {
     resetAudioMode()
   }
 
-  // --- Lifecycle Management ---
   fun onApplicationTerminate() {
     Log.d(TAG, "Application terminating")
     activeCalls.keys.toList().forEach { callId ->
@@ -1189,12 +1229,10 @@ object CallEngine {
     telecomConnections.clear()
     callMetadata.clear()
     currentCallId = null
-
     cleanup()
     lockScreenBypassCallbacks.clear()
     eventHandler = null
     cachedEvents.clear()
-
     isInitialized.set(false)
     appContext = null
   }

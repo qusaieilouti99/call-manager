@@ -40,6 +40,17 @@ class MyConnection(
         Log.d(TAG, "MyConnection for callId $callId created and added to CallEngine. Type: $callType")
     }
 
+    // --- THIS IS THE MISSING PIECE ---
+    /**
+     * Called by the system when the user presses a volume key during ringing.
+     */
+    override fun onSilence() {
+        super.onSilence()
+        Log.d(TAG, "onSilence called by system for callId: $callId. Silencing ringtone.")
+        CallEngine.silenceIncomingCall()
+    }
+    // ---------------------------------
+
     override fun onAnswer() {
         Log.d(TAG, "Call answered via Telecom for callId: $callId")
         setActive()
@@ -84,9 +95,6 @@ class MyConnection(
             }
         }
 
-        // Only react to route change if it's different.
-        // DO NOT emit AUDIO_ROUTE_CHANGED from here, let CallEngine's
-        // AudioDeviceCallback handle it for consistency and to avoid duplication.
         if (lastAudioState == null || lastAudioState!!.route != state.route) {
             Log.d(TAG, "System audio route changed for callId: $callId. Telecom route: ${state.route}")
         }
@@ -118,6 +126,9 @@ class MyConnection(
         Log.d(TAG, "Connection state changed for callId: $callId. New state: $state")
 
         when (state) {
+            STATE_RINGING -> {
+                Log.d(TAG, "Connection is now ringing for callId: $callId")
+            }
             STATE_HOLDING -> {
                 Log.d(TAG, "Connection is now holding for callId: $callId")
             }
