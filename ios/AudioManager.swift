@@ -97,7 +97,10 @@ class AudioManager {
       }
     }
     let route = determineCurrentRoute()
-    let info = AudioRoutesInfo(devices: devices, currentRoute: route)
+
+    // Convert strings to StringHolder objects
+    let deviceHolders = devices.map { StringHolder(value: $0) }
+    let info = AudioRoutesInfo(devices: deviceHolders, currentRoute: route)
     return info
   }
 

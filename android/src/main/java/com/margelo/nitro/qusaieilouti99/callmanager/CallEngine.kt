@@ -673,8 +673,11 @@ object CallEngine {
 
     val current = getCurrentAudioRoute()
     Log.d(TAG, "Available audio devices: ${devices.toList()}, current: $current")
-    lastAudioRoutesInfo = AudioRoutesInfo(devices.toTypedArray(), current)
-    return AudioRoutesInfo(devices.toTypedArray(), current)
+
+    // Convert strings to StringHolder objects
+    val deviceHolders = devices.map { StringHolder(it) }.toTypedArray()
+    lastAudioRoutesInfo = AudioRoutesInfo(deviceHolders, current)
+    return AudioRoutesInfo(deviceHolders, current)
   }
 
   fun setAudioRoute(route: String) {
@@ -744,9 +747,11 @@ object CallEngine {
 
   private fun setInitialAudioRoute(callType: String) {
     val avail = getAudioDevices()
+    // Extract string values for comparison
+    val deviceStrings = avail.devices.map { it.value }
     val defaultRoute = when {
-      avail.devices.contains("Bluetooth") -> "Bluetooth"
-      avail.devices.contains("Headset") -> "Headset"
+      deviceStrings.contains("Bluetooth") -> "Bluetooth"
+      deviceStrings.contains("Headset") -> "Headset"
       callType == "Video" -> "Speaker"
       else -> "Earpiece"
     }
@@ -771,12 +776,14 @@ object CallEngine {
 
   private fun emitAudioRouteChanged() {
     val info = getAudioDevices()
+    // Extract string values from StringHolder objects
+    val deviceStrings = info.devices.map { it.value }
     val payload = JSONObject().apply {
-      put("devices", JSONArray(info.devices.toList()))
+      put("devices", JSONArray(deviceStrings))
       put("currentRoute", info.currentRoute)
     }
     emitEvent(CallEventType.AUDIO_ROUTE_CHANGED, payload)
-    Log.d(TAG, "Audio route changed: ${info.currentRoute}, available: ${info.devices.toList()}")
+    Log.d(TAG, "Audio route changed: ${info.currentRoute}, available: $deviceStrings")
   }
 
   private val audioDeviceCallback = object : AudioDeviceCallback() {
@@ -792,12 +799,14 @@ object CallEngine {
 
   private fun emitAudioDevicesChanged() {
     val info = getAudioDevices()
+    // Extract string values from StringHolder objects
+    val deviceStrings = info.devices.map { it.value }
     val payload = JSONObject().apply {
-      put("devices", JSONArray(info.devices.toList()))
+      put("devices", JSONArray(deviceStrings))
       put("currentRoute", info.currentRoute)
     }
     emitEvent(CallEventType.AUDIO_DEVICES_CHANGED, payload)
-    Log.d(TAG, "Audio devices changed: available: ${info.devices.toList()}")
+    Log.d(TAG, "Audio devices changed: available: $deviceStrings")
   }
 
   fun registerAudioDeviceCallback() {

@@ -2,9 +2,15 @@
 import { type HybridObject, NitroModules } from 'react-native-nitro-modules';
 import type { CallEventType } from './CallEventType';
 
+
+// This is workaround for a swift compiler bug, its preventing us from using string[].
+export interface StringHolder {
+  value: string;
+}
+
 // Define the structure for audio device information
 export interface AudioRoutesInfo {
-  devices: string[]; // List of available audio device types (e.g., "Speaker", "Earpiece", "Bluetooth", "Headset")
+  devices: StringHolder[]; // List of available audio device types (e.g., "Speaker", "Earpiece", "Bluetooth", "Headset")
   currentRoute: string; // Currently active audio route (e.g., "Speaker", "Earpiece", "Bluetooth", "Headset", "Unknown")
 }
 

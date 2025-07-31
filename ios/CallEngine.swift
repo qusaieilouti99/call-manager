@@ -443,15 +443,19 @@ extension CallEngine: CallKitManagerDelegate {
 extension CallEngine: AudioManagerDelegate {
   func audioManager(_ manager: AudioManager, didChangeRoute routeInfo: AudioRoutesInfo)
   {
+    // Extract string values from StringHolder objects
+    let deviceStrings = routeInfo.devices.map { $0.value }
     emitEvent(.audioRouteChanged,
-              data: ["devices": routeInfo.devices,
+              data: ["devices": deviceStrings,
                      "currentRoute": routeInfo.currentRoute])
   }
 
   func audioManager(_ manager: AudioManager, didChangeDevices routeInfo: AudioRoutesInfo)
   {
+    // Extract string values from StringHolder objects
+    let deviceStrings = routeInfo.devices.map { $0.value }
     emitEvent(.audioDevicesChanged,
-              data: ["devices": routeInfo.devices,
+              data: ["devices": deviceStrings,
                      "currentRoute": routeInfo.currentRoute])
   }
 
