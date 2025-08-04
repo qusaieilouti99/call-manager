@@ -62,7 +62,7 @@ class CallEngine {
 
     // MARK: Incoming
 
-    func reportIncomingCall(callId: String,
+   func reportIncomingCall(callId: String,
                            callType: String,
                            displayName: String,
                            pictureUrl: String? = nil,
@@ -75,8 +75,7 @@ class CallEngine {
         }
 
         // collision
-        if let inc = activeCalls.values.first(where: { $0.state == .incoming }),
-           inc.callId != callId
+        if let inc = activeCalls.values.first(where: { $0.state == .incoming })
         {
             logger.warning("incoming collision → reject \(callId)")
             emitEvent(.callRejected, data: ["callId": callId, "reason": "Another incoming exists"])
