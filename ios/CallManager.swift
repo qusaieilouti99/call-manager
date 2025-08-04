@@ -87,8 +87,8 @@ public class CallManager: HybridCallManagerSpec {
     CallEngine.shared.reportIncomingCall(
       callId: callId,
       callType: callType,
-      targetName: targetName,
-      nil,
+      displayName: targetName,
+      pictureUrl: nil,
       metadata: metadata
     )
   }
