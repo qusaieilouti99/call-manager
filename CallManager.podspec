@@ -27,6 +27,7 @@ Pod::Spec.new do |s|
 
   s.dependency 'React-jsi'
   s.dependency 'React-callinvoker'
+  s.dependency 'JitsiWebRTC'
 
   load 'nitrogen/generated/ios/CallManager+autolinking.rb'
   add_nitrogen_files(s)

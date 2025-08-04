@@ -2,7 +2,6 @@
 import { type HybridObject, NitroModules } from 'react-native-nitro-modules';
 import type { CallEventType } from './CallEventType';
 
-
 // This is workaround for a swift compiler bug, its preventing us from using string[].
 export interface StringHolder {
   value: string;
@@ -14,7 +13,8 @@ export interface AudioRoutesInfo {
   currentRoute: string; // Currently active audio route (e.g., "Speaker", "Earpiece", "Bluetooth", "Headset", "Unknown")
 }
 
-export interface CallManager extends HybridObject<{ ios: 'swift'; android: 'kotlin' }> {
+export interface CallManager
+  extends HybridObject<{ ios: 'swift'; android: 'kotlin' }> {
   // Call control
   endCall(callId: string): void;
   silenceRingtone(): void;
@@ -26,11 +26,29 @@ export interface CallManager extends HybridObject<{ ios: 'swift'; android: 'kotl
   keepScreenAwake(keepAwake: boolean): void;
 
   endAllCalls(): void;
-  startOutgoingCall(callId: string, callType: string, targetName: string, metadata?: string): void;
-  startCall(callId: string, callType: string, targetName: string, metadata?: string): void;
+  startOutgoingCall(
+    callId: string,
+    callType: string,
+    targetName: string,
+    metadata?: string
+  ): void;
+  startCall(
+    callId: string,
+    callType: string,
+    targetName: string,
+    metadata?: string
+  ): void;
   setOnHold(callId: string, onHold: boolean): void;
   setMuted(callId: string, muted: boolean): void;
   updateDisplayCallInformation(callId: string, callerName: string): void;
+
+  // added just new
+  reportIncomingCall(
+    callId: string,
+    callType: string,
+    targetName: string,
+    metadata?: string
+  ): void;
 
   // Event emitter: addListener returns a remove function
   addListener(
@@ -43,9 +61,8 @@ export interface CallManager extends HybridObject<{ ios: 'swift'; android: 'kotl
     listener: (payload: string) => void
   ): () => void;
 
-
+  hasActiveCall(): boolean; // if there is an active call, no matter ringing, incoming, outgoing, whatever
 }
-
 
 export const CallManagerHybridObject =
   NitroModules.createHybridObject<CallManager>('CallManager');

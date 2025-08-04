@@ -108,4 +108,23 @@ class CallManager : HybridCallManagerSpec() {
             Log.d(TAG, "registerVoIPTokenListener removed.")
         }
     }
+
+    override fun hasActiveCall(): Boolean {
+        Log.d(TAG, "hasActiveCall (from JS)")
+        ensureInitialized()
+        return CallEngine.isCallActive()
+    }
+
+    override fun reportIncomingCall(callId: String, callType: String, targetName: String, metadata: String?) {
+        Log.d(TAG, "reportIncomingCall requested: callId=$callId, callType=$callType, targetName=$targetName")
+        ensureInitialized()
+        CallEngine.reportIncomingCall(
+          requireNotNull(CallEngine.getContext()) { "CallEngine must be initialized with context" },
+          callId,
+          callType,
+          targetName,
+          null,
+          metadata
+        )
+    }
 }

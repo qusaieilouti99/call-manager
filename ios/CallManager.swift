@@ -130,4 +130,9 @@ public class CallManager: HybridCallManagerSpec {
       VoIPTokenManager.shared.unregisterTokenListener()
     }
   }
+
+  public func hasActiveCall() throws -> Bool {
+    logger.info("🎯 hasActiveCall ▶ js → native")
+    return CallEngine.shared.hasActiveCalls()
+  }
 }

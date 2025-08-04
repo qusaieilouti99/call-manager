@@ -1,4 +1,3 @@
-// File: CallEngine.kt
 package com.margelo.nitro.qusaieilouti99.callmanager
 
 import android.app.ActivityManager
@@ -112,6 +111,11 @@ object CallEngine {
     )
   }
 
+  /**
+   * Get the application context. Returns null if not initialized.
+   */
+  fun getContext(): Context? = appContext
+
   fun setEventHandler(handler: ((CallEventType, String) -> Unit)?) {
     Log.d(TAG, "setEventHandler called. Handler present: ${handler != null}")
     eventHandler = handler
@@ -133,6 +137,33 @@ object CallEngine {
       Log.d(TAG, "No event handler, caching event: $type")
       cachedEvents.add(Pair(type, dataString))
     }
+  }
+
+  /**
+   * NEW: Check if device supports CallStyle notifications
+   */
+  private fun supportsCallStyleNotifications(): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
+
+    val manufacturer = Build.MANUFACTURER.lowercase()
+    val brand = Build.BRAND.lowercase()
+
+    // Known good manufacturers that support CallStyle properly
+    val supportedManufacturers = setOf(
+      "google", "samsung", "oneplus", "motorola", "sony", "lg", "htc"
+    )
+
+    val supportedBrands = setOf(
+      "google", "samsung", "oneplus", "motorola", "sony", "lg", "htc", "pixel"
+    )
+
+    val isSupported = supportedManufacturers.contains(manufacturer) ||
+                     supportedBrands.contains(brand) ||
+                     manufacturer.contains("google") ||
+                     brand.contains("pixel")
+
+    Log.d(TAG, "CallStyle support check - Manufacturer: $manufacturer, Brand: $brand, Supported: $isSupported")
+    return isSupported
   }
 
   /**
@@ -367,9 +398,13 @@ object CallEngine {
     bringAppToForeground()
     startForegroundService()
     keepScreenAwake(true)
-    setInitialAudioRoute(callType)
-    updateLockScreenBypass()
 
+    // NEW: Improved initial audio route setting with better timing
+    mainHandler.postDelayed({
+      setInitialAudioRoute(callType)
+    }, 500L)
+
+    updateLockScreenBypass()
     emitOutgoingCallAnsweredWithMetadata(callId)
   }
 
@@ -415,7 +450,7 @@ object CallEngine {
     setAudioMode()
     mainHandler.postDelayed({
       setInitialAudioRoute(callInfo.callType)
-    }, 300L)
+    }, 800L)
 
     if (isLocalAnswer) {
       emitCallAnsweredWithMetadata(callId)
@@ -881,6 +916,8 @@ object CallEngine {
       channel.enableVibration(true)
       channel.setBypassDnd(true)
       channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+
+      // NEW: Improved sound handling to prevent double ringing
       if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
         channel.setSound(
           RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE),
@@ -890,6 +927,7 @@ object CallEngine {
             .build()
         )
       } else {
+        // For API 31+, disable notification sound to prevent conflicts with custom ringtone
         channel.setSound(null, null)
         channel.importance = NotificationManager.IMPORTANCE_HIGH
       }
@@ -902,11 +940,14 @@ object CallEngine {
     val context = requireContext()
     Log.d(TAG, "Showing incoming call UI for $callId")
 
-    if (isDeviceLocked(context)) {
-      Log.d(TAG, "Device is locked - using overlay approach")
+    val useCallStyleNotification = supportsCallStyleNotifications()
+    Log.d(TAG, "Using CallStyle notification: $useCallStyleNotification")
+
+    if (isDeviceLocked(context) || !useCallStyleNotification) {
+      Log.d(TAG, "Device is locked or CallStyle not supported - using overlay/fallback approach")
       showCallActivityOverlay(context, callId, callerName, callType, callerPicUrl)
     } else {
-      Log.d(TAG, "Device is unlocked - using standard notification")
+      Log.d(TAG, "Device is unlocked and supports CallStyle - using enhanced notification")
       showStandardNotification(context, callId, callerName, callType, callerPicUrl)
     }
     playRingtone()
@@ -940,9 +981,9 @@ object CallEngine {
       )
       wakeLock.acquire(5000)
       context.startActivity(overlayIntent)
-      Log.d(TAG, "Successfully launched CallActivity overlay for locked device")
+      Log.d(TAG, "Successfully launched CallActivity overlay")
     } catch (e: Exception) {
-      Log.e(TAG, "Overlay failed, falling back to notification: ${e.message}")
+      Log.e(TAG, "Overlay failed, falling back to standard notification: ${e.message}")
       showStandardNotification(context, callId, callerName, callType, callerPicUrl)
     }
   }
@@ -982,7 +1023,7 @@ object CallEngine {
       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
     )
 
-    val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+    val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && supportsCallStyleNotifications()) {
       val person = android.app.Person.Builder()
         .setName(callerName)
         .setImportant(true)
