@@ -40,16 +40,11 @@ class MyConnection(
         Log.d(TAG, "MyConnection for callId $callId created and added to CallEngine. Type: $callType")
     }
 
-    // --- THIS IS THE MISSING PIECE ---
-    /**
-     * Called by the system when the user presses a volume key during ringing.
-     */
     override fun onSilence() {
         super.onSilence()
         Log.d(TAG, "onSilence called by system for callId: $callId. Silencing ringtone.")
         CallEngine.silenceIncomingCall()
     }
-    // ---------------------------------
 
     override fun onAnswer() {
         Log.d(TAG, "Call answered via Telecom for callId: $callId")
@@ -97,6 +92,8 @@ class MyConnection(
 
         if (lastAudioState == null || lastAudioState!!.route != state.route) {
             Log.d(TAG, "System audio route changed for callId: $callId. Telecom route: ${state.route}")
+            // Notify CallEngine about the actual route change
+            CallEngine.onTelecomAudioRouteChanged(callId, state)
         }
 
         lastAudioState = state
@@ -134,11 +131,19 @@ class MyConnection(
             }
             STATE_ACTIVE -> {
                 Log.d(TAG, "Connection is now active for callId: $callId")
+                // Set initial audio route when call becomes active
+                CallEngine.setInitialAudioRouteForCall(callId, callType)
             }
             STATE_DISCONNECTED -> {
                 Log.d(TAG, "Connection is now disconnected for callId: $callId")
                 CallEngine.removeTelecomConnection(callId)
             }
         }
+    }
+
+    // NEW: Method to set audio route through telecom
+    fun setTelecomAudioRoute(route: Int) {
+        Log.d(TAG, "Setting telecom audio route to: $route for callId: $callId")
+        setAudioRoute(route)
     }
 }

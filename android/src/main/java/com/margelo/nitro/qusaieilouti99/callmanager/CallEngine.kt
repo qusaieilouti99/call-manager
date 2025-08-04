@@ -1,5 +1,5 @@
 package com.margelo.nitro.qusaieilouti99.callmanager
-
+import android.telecom.CallAudioState
 import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
@@ -40,8 +40,11 @@ import android.os.VibrationEffect
  * Core call‐management engine. Manages self-managed telecom calls,
  * audio routing, UI notifications, etc.
  *
- * NOTE: Volume key silencing is now handled by the system via `Connection.onSilence()`,
- * which calls `silenceIncomingCall()` on this object.
+ * Audio routing follows Android standards:
+ * - Audio calls default to earpiece unless BT/headset connected
+ * - Video calls default to speaker unless BT/headset connected
+ * - System handles route changes when devices connect/disconnect
+ * - Manual route changes are always respected
  */
 object CallEngine {
   private const val TAG = "CallEngine"
@@ -80,11 +83,15 @@ object CallEngine {
 
   private var currentCallId: String? = null
   private var canMakeMultipleCalls: Boolean = false
-  private var lastAudioRoutesInfo: AudioRoutesInfo? = null
   private var lockScreenBypassActive = false
   private val lockScreenBypassCallbacks = mutableSetOf<LockScreenBypassCallback>()
   private var eventHandler: ((CallEventType, String) -> Unit)? = null
   private val cachedEvents = mutableListOf<Pair<CallEventType, String>>()
+
+  // Audio routing state
+  private var currentAudioRoute: String = "Earpiece"
+  private var wasManuallySet: Boolean = false
+  private var callStartTime: Long = 0
 
   interface LockScreenBypassCallback {
     fun onLockScreenBypassChanged(shouldBypass: Boolean)
@@ -111,9 +118,6 @@ object CallEngine {
     )
   }
 
-  /**
-   * Get the application context. Returns null if not initialized.
-   */
   fun getContext(): Context? = appContext
 
   fun setEventHandler(handler: ((CallEventType, String) -> Unit)?) {
@@ -139,16 +143,12 @@ object CallEngine {
     }
   }
 
-  /**
-   * NEW: Check if device supports CallStyle notifications
-   */
   private fun supportsCallStyleNotifications(): Boolean {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
 
     val manufacturer = Build.MANUFACTURER.lowercase()
     val brand = Build.BRAND.lowercase()
 
-    // Known good manufacturers that support CallStyle properly
     val supportedManufacturers = setOf(
       "google", "samsung", "oneplus", "motorola", "sony", "lg", "htc"
     )
@@ -166,10 +166,6 @@ object CallEngine {
     return isSupported
   }
 
-  /**
-   * Silences the incoming call ringtone. This is called by `Connection.onSilence()`
-   * when the user presses a volume key during ringing.
-   */
   fun silenceIncomingCall() {
     Log.d(TAG, "Silencing incoming call ringtone via Connection.onSilence()")
     stopRingtone()
@@ -391,6 +387,8 @@ object CallEngine {
     activeCalls[callId] =
       CallInfo(callId, callType, targetName, null, CallState.ACTIVE)
     currentCallId = callId
+    callStartTime = System.currentTimeMillis()
+    wasManuallySet = false
     Log.d(TAG, "Call $callId started as ACTIVE")
 
     registerPhoneAccount()
@@ -399,7 +397,10 @@ object CallEngine {
     startForegroundService()
     keepScreenAwake(true)
 
-    // NEW: Improved initial audio route setting with better timing
+    // Register audio device callback to handle dynamic device changes
+    registerAudioDeviceCallback()
+
+    // Set initial audio route based on call type and available devices
     mainHandler.postDelayed({
       setInitialAudioRoute(callType)
     }, 500L)
@@ -428,6 +429,8 @@ object CallEngine {
 
     activeCalls[callId] = callInfo.copy(state = CallState.ACTIVE)
     currentCallId = callId
+    callStartTime = System.currentTimeMillis()
+    wasManuallySet = false
     Log.d(TAG, "Call $callId set to ACTIVE state")
 
     stopRingtone()
@@ -448,6 +451,11 @@ object CallEngine {
     updateLockScreenBypass()
 
     setAudioMode()
+
+    // Register audio device callback to handle dynamic device changes
+    registerAudioDeviceCallback()
+
+    // Set initial audio route with proper timing
     mainHandler.postDelayed({
       setInitialAudioRoute(callInfo.callType)
     }, 800L)
@@ -679,119 +687,262 @@ object CallEngine {
     })
   }
 
+  // ====== IMPROVED AUDIO ROUTING SYSTEM ======
+
   fun getAudioDevices(): AudioRoutesInfo {
     val context = requireContext()
     audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
       ?: return AudioRoutesInfo(emptyArray(), "Unknown")
 
     val devices = mutableSetOf<String>()
-    devices.add("Speaker")
+    var hasWiredHeadset = false
+    var hasBluetoothDevice = false
+
+    // Always available
     devices.add("Earpiece")
+    devices.add("Speaker")
 
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-      val infos = audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-      infos?.forEach { d ->
-        when (d.type) {
+      val outputDevices = audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS) ?: emptyArray()
+      for (device in outputDevices) {
+        when (device.type) {
           AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
-          AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> devices.add("Bluetooth")
+          AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> {
+            if (!hasBluetoothDevice) {
+              devices.add("Bluetooth")
+              hasBluetoothDevice = true
+            }
+          }
           AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
-          AudioDeviceInfo.TYPE_WIRED_HEADSET -> devices.add("Headset")
+          AudioDeviceInfo.TYPE_WIRED_HEADSET,
+          AudioDeviceInfo.TYPE_USB_HEADSET -> {
+            if (!hasWiredHeadset) {
+              devices.add("Headset")
+              hasWiredHeadset = true
+            }
+          }
+          AudioDeviceInfo.TYPE_BLE_HEADSET -> {
+            if (!hasBluetoothDevice) {
+              devices.add("Bluetooth")
+              hasBluetoothDevice = true
+            }
+          }
         }
       }
     } else {
+      // Fallback for older API levels
       @Suppress("DEPRECATION")
-      if (audioManager?.isBluetoothA2dpOn == true || audioManager?.isBluetoothScoOn == true)
+      if (audioManager?.isBluetoothA2dpOn == true || audioManager?.isBluetoothScoOn == true) {
         devices.add("Bluetooth")
+        hasBluetoothDevice = true
+      }
       @Suppress("DEPRECATION")
-      if (audioManager?.isWiredHeadsetOn == true) devices.add("Headset")
+      if (audioManager?.isWiredHeadsetOn == true) {
+        devices.add("Headset")
+        hasWiredHeadset = true
+      }
     }
 
     val current = getCurrentAudioRoute()
     Log.d(TAG, "Available audio devices: ${devices.toList()}, current: $current")
 
-    // Convert strings to StringHolder objects
     val deviceHolders = devices.map { StringHolder(it) }.toTypedArray()
-    lastAudioRoutesInfo = AudioRoutesInfo(deviceHolders, current)
     return AudioRoutesInfo(deviceHolders, current)
   }
 
-  fun setAudioRoute(route: String) {
-    Log.d(TAG, "setAudioRoute called: $route")
+  // NEW: Handle telecom audio route changes
+  fun onTelecomAudioRouteChanged(callId: String, audioState: CallAudioState) {
+      Log.d(TAG, "Telecom audio route changed for $callId: route=${audioState.route}")
 
+      val routeString = when (audioState.route) {
+          CallAudioState.ROUTE_EARPIECE -> "Earpiece"
+          CallAudioState.ROUTE_SPEAKER -> "Speaker"
+          CallAudioState.ROUTE_BLUETOOTH -> "Bluetooth"
+          CallAudioState.ROUTE_WIRED_HEADSET -> "Headset"
+          else -> "Unknown"
+      }
+
+      Log.d(TAG, "Emitting AUDIO_ROUTE_CHANGED: currentRoute=$routeString")
+      emitAudioRouteChanged(routeString)
+  }
+
+  // NEW: Set initial audio route using telecom
+  fun setInitialAudioRouteForCall(callId: String, callType: String) {
+      Log.d(TAG, "Setting initial audio route for $callId, type: $callType")
+
+      // Determine the desired route
+      val desiredRoute = when {
+          isBluetoothDeviceConnected() -> CallAudioState.ROUTE_BLUETOOTH
+          isWiredHeadsetConnected() -> CallAudioState.ROUTE_WIRED_HEADSET
+          callType.equals("Video", ignoreCase = true) -> CallAudioState.ROUTE_SPEAKER
+          else -> CallAudioState.ROUTE_EARPIECE
+      }
+
+      // Use telecom connection to set the route
+      telecomConnections[callId]?.let { connection ->
+          if (connection is MyConnection) {
+              mainHandler.postDelayed({
+                  connection.setTelecomAudioRoute(desiredRoute)
+                  Log.d(TAG, "Set initial telecom audio route to: $desiredRoute")
+              }, 200)
+          }
+      }
+  }
+
+ // UPDATED: Use telecom for manual route changes
+  fun setAudioRoute(route: String) {
+     Log.d(TAG, "setAudioRoute called: $route (manual)")
+     wasManuallySet = true
+
+     val telecomRoute = when (route) {
+         "Speaker" -> CallAudioState.ROUTE_SPEAKER
+         "Earpiece" -> CallAudioState.ROUTE_EARPIECE
+         "Bluetooth" -> CallAudioState.ROUTE_BLUETOOTH
+         "Headset" -> CallAudioState.ROUTE_WIRED_HEADSET
+         else -> {
+             Log.w(TAG, "Unknown audio route: $route")
+             return
+         }
+     }
+
+     // Set route through active telecom connection
+     currentCallId?.let { callId ->
+         telecomConnections[callId]?.let { connection ->
+             if (connection is MyConnection) {
+                 connection.setTelecomAudioRoute(telecomRoute)
+                 Log.d(TAG, "Set telecom audio route to: $telecomRoute for $route")
+             }
+         }
+     }
+ }
+
+  private fun applyAudioRoute(route: String) {
     val ctx = requireContext()
     if (audioManager == null) {
       audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     }
     val am = audioManager!!
 
+    // Ensure we're in the correct audio mode
     if (am.mode != AudioManager.MODE_IN_COMMUNICATION) {
       am.mode = AudioManager.MODE_IN_COMMUNICATION
     }
 
+    val previousRoute = currentAudioRoute
+
     when (route) {
       "Speaker" -> {
         am.isSpeakerphoneOn = true
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && am.isBluetoothScoOn) {
+        if (am.isBluetoothScoOn) {
           am.stopBluetoothSco()
           am.isBluetoothScoOn = false
         }
-        Log.d(TAG, "Audio routed to SPEAKER")
+        currentAudioRoute = "Speaker"
+        Log.d(TAG, "Audio route set to SPEAKER")
       }
       "Earpiece" -> {
         am.isSpeakerphoneOn = false
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && am.isBluetoothScoOn) {
+        if (am.isBluetoothScoOn) {
           am.stopBluetoothSco()
           am.isBluetoothScoOn = false
         }
-        Log.d(TAG, "Audio routed to EARPIECE")
+        currentAudioRoute = "Earpiece"
+        Log.d(TAG, "Audio route set to EARPIECE")
       }
       "Bluetooth" -> {
         am.isSpeakerphoneOn = false
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        if (!am.isBluetoothScoOn) {
           am.startBluetoothSco()
           am.isBluetoothScoOn = true
-          Log.d(TAG, "Audio routed to BLUETOOTH")
-        } else {
-          Log.w(TAG, "Bluetooth SCO not supported on this OS version")
         }
+        currentAudioRoute = "Bluetooth"
+        Log.d(TAG, "Audio route set to BLUETOOTH")
       }
       "Headset" -> {
         am.isSpeakerphoneOn = false
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && am.isBluetoothScoOn) {
+        if (am.isBluetoothScoOn) {
           am.stopBluetoothSco()
           am.isBluetoothScoOn = false
         }
-        Log.d(TAG, "Audio routed to HEADSET")
+        // For wired headsets, the system automatically routes audio when connected
+        currentAudioRoute = "Headset"
+        Log.d(TAG, "Audio route set to HEADSET")
       }
       else -> {
         Log.w(TAG, "Unknown audio route: $route")
         return
       }
     }
-    emitAudioRouteChanged()
+
+    // Only emit event if route actually changed
+    if (currentAudioRoute != previousRoute) {
+      emitAudioRouteChanged(currentAudioRoute)
+    }
   }
 
   private fun getCurrentAudioRoute(): String {
+    val am = audioManager ?: return "Unknown"
+
+    // Check in order of priority: Bluetooth -> Headset -> Speaker -> Earpiece
     return when {
-      audioManager?.isBluetoothScoOn == true -> "Bluetooth"
-      audioManager?.isSpeakerphoneOn == true -> "Speaker"
-      audioManager?.isWiredHeadsetOn == true -> "Headset"
+      am.isBluetoothScoOn -> "Bluetooth"
+      isWiredHeadsetConnected() -> "Headset"
+      am.isSpeakerphoneOn -> "Speaker"
       else -> "Earpiece"
+    }
+  }
+
+  private fun isWiredHeadsetConnected(): Boolean {
+    val am = audioManager ?: return false
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+      val devices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+      return devices.any { device ->
+        device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+        device.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+        device.type == AudioDeviceInfo.TYPE_USB_HEADSET
+      }
+    } else {
+      @Suppress("DEPRECATION")
+      return am.isWiredHeadsetOn
+    }
+  }
+
+  private fun isBluetoothDeviceConnected(): Boolean {
+    val am = audioManager ?: return false
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+      val devices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+      return devices.any { device ->
+        device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+        device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+        device.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+      }
+    } else {
+      @Suppress("DEPRECATION")
+      return am.isBluetoothA2dpOn || am.isBluetoothScoOn
     }
   }
 
   private fun setInitialAudioRoute(callType: String) {
-    val avail = getAudioDevices()
-    // Extract string values for comparison
-    val deviceStrings = avail.devices.map { it.value }
-    val defaultRoute = when {
-      deviceStrings.contains("Bluetooth") -> "Bluetooth"
-      deviceStrings.contains("Headset") -> "Headset"
-      callType == "Video" -> "Speaker"
-      else -> "Earpiece"
+    Log.d(TAG, "Setting initial audio route for call type: $callType")
+
+    // Don't override if user manually set a route
+    if (wasManuallySet) {
+      Log.d(TAG, "Audio route was manually set, skipping initial route")
+      return
     }
-    Log.d(TAG, "Setting initial audio route: $defaultRoute for call type: $callType")
-    setAudioRoute(defaultRoute)
+
+    // Determine default route based on Android standards
+    val defaultRoute = when {
+      isBluetoothDeviceConnected() -> "Bluetooth"
+      isWiredHeadsetConnected() -> "Headset"
+      callType.equals("Video", ignoreCase = true) -> "Speaker"
+      else -> "Earpiece" // Default for audio calls
+    }
+
+    Log.d(TAG, "Setting initial audio route to: $defaultRoute")
+    applyAudioRoute(defaultRoute)
   }
 
   private fun setAudioMode() {
@@ -801,40 +952,124 @@ object CallEngine {
 
   private fun resetAudioMode() {
     if (activeCalls.isEmpty()) {
-      audioManager?.mode = AudioManager.MODE_NORMAL
-      audioManager?.stopBluetoothSco()
-      audioManager?.isBluetoothScoOn = false
-      audioManager?.isSpeakerphoneOn = false
+      audioManager?.let { am ->
+        am.mode = AudioManager.MODE_NORMAL
+        if (am.isBluetoothScoOn) {
+          am.stopBluetoothSco()
+          am.isBluetoothScoOn = false
+        }
+        am.isSpeakerphoneOn = false
+      }
+      currentAudioRoute = "Earpiece"
+      wasManuallySet = false
+      unregisterAudioDeviceCallback()
       Log.d(TAG, "Audio mode reset to MODE_NORMAL")
     }
   }
 
-  private fun emitAudioRouteChanged() {
-    val info = getAudioDevices()
-    // Extract string values from StringHolder objects
-    val deviceStrings = info.devices.map { it.value }
-    val payload = JSONObject().apply {
-      put("devices", JSONArray(deviceStrings))
-      put("currentRoute", info.currentRoute)
-    }
-    emitEvent(CallEventType.AUDIO_ROUTE_CHANGED, payload)
-    Log.d(TAG, "Audio route changed: ${info.currentRoute}, available: $deviceStrings")
+  // UPDATED: Fix the method signature
+  private fun emitAudioRouteChanged(currentRoute: String) {
+      val info = getAudioDevices()
+      val deviceStrings = info.devices.map { it.value }
+      val payload = JSONObject().apply {
+          put("devices", JSONArray(deviceStrings))
+          put("currentRoute", currentRoute)
+      }
+      emitEvent(CallEventType.AUDIO_ROUTE_CHANGED, payload)
+      Log.d(TAG, "Audio route changed: $currentRoute, available: $deviceStrings")
   }
 
   private val audioDeviceCallback = object : AudioDeviceCallback() {
     override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
       Log.d(TAG, "Audio devices added")
-      emitAudioDevicesChanged()
+      handleAudioDeviceChange(addedDevices, true)
     }
+
     override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
       Log.d(TAG, "Audio devices removed")
-      emitAudioDevicesChanged()
+      handleAudioDeviceChange(removedDevices, false)
     }
+  }
+
+  private fun handleAudioDeviceChange(devices: Array<out AudioDeviceInfo>?, isAdded: Boolean) {
+    if (devices == null || !isCallActive()) return
+
+    val context = requireContext()
+    val currentCallInfo = getCurrentActiveCall()
+    if (currentCallInfo == null) {
+      Log.d(TAG, "No active call, ignoring device change")
+      return
+    }
+
+    val relevantDevices = devices.filter { device ->
+      device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+      device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+      device.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+      device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+      device.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+      device.type == AudioDeviceInfo.TYPE_USB_HEADSET
+    }
+
+    if (relevantDevices.isEmpty()) {
+      Log.d(TAG, "No relevant devices in change event")
+      return
+    }
+
+    Log.d(TAG, "Relevant device change detected. Added: $isAdded, wasManuallySet: $wasManuallySet")
+
+    if (isAdded && !wasManuallySet) {
+      // Device connected - switch to it automatically if user hasn't manually set route
+      val deviceType = relevantDevices.first().type
+      val newRoute = when (deviceType) {
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+        AudioDeviceInfo.TYPE_BLE_HEADSET -> "Bluetooth"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET,
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "Headset"
+        else -> null
+      }
+
+      if (newRoute != null && newRoute != currentAudioRoute) {
+        Log.d(TAG, "Auto-switching to newly connected device: $newRoute")
+        // Add slight delay to ensure device is ready
+        mainHandler.postDelayed({
+          applyAudioRoute(newRoute)
+        }, 300)
+      }
+    } else if (!isAdded) {
+      // Device disconnected - fall back to appropriate route
+      val disconnectedType = relevantDevices.first().type
+      val wasCurrentRoute = when (disconnectedType) {
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+        AudioDeviceInfo.TYPE_BLE_HEADSET -> currentAudioRoute == "Bluetooth"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET,
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+        AudioDeviceInfo.TYPE_USB_HEADSET -> currentAudioRoute == "Headset"
+        else -> false
+      }
+
+      if (wasCurrentRoute) {
+        Log.d(TAG, "Current audio device disconnected, falling back")
+        // Reset manual flag since the manually selected device is gone
+        wasManuallySet = false
+        mainHandler.postDelayed({
+          setInitialAudioRoute(currentCallInfo.callType)
+        }, 300)
+      }
+    }
+
+    // Always emit devices changed event
+    emitAudioDevicesChanged()
+  }
+
+  private fun getCurrentActiveCall(): CallInfo? {
+    return activeCalls.values.find { it.state == CallState.ACTIVE }
   }
 
   private fun emitAudioDevicesChanged() {
     val info = getAudioDevices()
-    // Extract string values from StringHolder objects
     val deviceStrings = info.devices.map { it.value }
     val payload = JSONObject().apply {
       put("devices", JSONArray(deviceStrings))
@@ -845,16 +1080,28 @@ object CallEngine {
   }
 
   fun registerAudioDeviceCallback() {
-    val context = requireContext()
-    audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    audioManager?.registerAudioDeviceCallback(audioDeviceCallback, null)
+    if (isCallActive()) {
+      val context = requireContext()
+      audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+      try {
+        audioManager?.registerAudioDeviceCallback(audioDeviceCallback, null)
+        Log.d(TAG, "Audio device callback registered")
+      } catch (e: Exception) {
+        Log.w(TAG, "Failed to register audio device callback: ${e.message}")
+      }
+    }
   }
 
   fun unregisterAudioDeviceCallback() {
-    val context = requireContext()
-    audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    audioManager?.unregisterAudioDeviceCallback(audioDeviceCallback)
+    try {
+      audioManager?.unregisterAudioDeviceCallback(audioDeviceCallback)
+      Log.d(TAG, "Audio device callback unregistered")
+    } catch (e: Exception) {
+      Log.w(TAG, "Failed to unregister audio device callback: ${e.message}")
+    }
   }
+
+  // ====== END AUDIO ROUTING SYSTEM ======
 
   fun keepScreenAwake(keepAwake: Boolean) {
     val context = requireContext()
@@ -917,7 +1164,6 @@ object CallEngine {
       channel.setBypassDnd(true)
       channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
 
-      // NEW: Improved sound handling to prevent double ringing
       if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
         channel.setSound(
           RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE),
@@ -927,7 +1173,6 @@ object CallEngine {
             .build()
         )
       } else {
-        // For API 31+, disable notification sound to prevent conflicts with custom ringtone
         channel.setSound(null, null)
         channel.importance = NotificationManager.IMPORTANCE_HIGH
       }
