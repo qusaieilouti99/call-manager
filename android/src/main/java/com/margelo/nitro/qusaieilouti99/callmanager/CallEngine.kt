@@ -238,7 +238,7 @@ object CallEngine {
     metadata?.let { callMetadata[callId] = it }
 
     val incomingCall = activeCalls.values.find { it.state == CallState.INCOMING }
-    if (incomingCall != null && incomingCall.callId != callId) {
+    if (incomingCall != null) {
       Log.d(TAG, "Incoming call collision detected. Auto-rejecting new call: $callId")
       rejectIncomingCallCollision(callId, "Another call is already incoming")
       return
