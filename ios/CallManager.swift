@@ -77,6 +77,23 @@ public class CallManager: HybridCallManagerSpec {
     )
   }
 
+  public func reportIncomingCall(callId: String,
+                                callType: String,
+                                targetName: String,
+                                metadata: String?) throws
+  {
+    logger.info("🎯 startOutgoingCall ▶ js → native: \(callId), type=\(callType)")
+    if let m = metadata { logger.debug("🎯 metadata.len=\(m.count)") }
+    CallEngine.shared.reportIncomingCall(
+      callId: callId,
+      callType: callType,
+      targetName: targetName,
+      nil,
+      metadata: metadata
+    )
+  }
+
+
   public func startCall(callId: String,
                         callType: String,
                         targetName: String,
