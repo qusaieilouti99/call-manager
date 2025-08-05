@@ -63,57 +63,83 @@ class CallEngine {
     // MARK: Incoming
 
    func reportIncomingCall(callId: String,
-                           callType: String,
-                           displayName: String,
-                           pictureUrl: String? = nil,
-                           metadata: String? = nil)
-    {
-        logger.info("reportIncomingCall: \(callId), \(displayName)")
-        if let m = metadata {
-            callMetadata[callId] = m
-            logger.info("metadata cached for \(callId)")
-        }
+                          callType: String,
+                          displayName: String,
+                          pictureUrl: String? = nil,
+                          metadata: String? = nil,
+                          completion: ((Bool) -> Void)? = nil) {
 
-        // collision
-        if let inc = activeCalls.values.first(where: { $0.state == .incoming })
-        {
-            logger.warning("incoming collision → reject \(callId)")
-            emitEvent(.callRejected, data: ["callId": callId, "reason": "Another incoming exists"])
-            return
-        }
+       logger.info("reportIncomingCall: \(callId), \(displayName)")
 
-        if !canMakeMultipleCalls &&
-            activeCalls.values.contains(where: { $0.state == .active || $0.state == .held })
-        {
-            logger.warning("active exists → reject incoming \(callId)")
-            emitEvent(.callRejected, data: ["callId": callId, "reason": "Another call is active"])
-            return
-        }
+       // Check for exact duplicate (same callId already exists)
+       if activeCalls[callId] != nil {
+           logger.warning("🔄 Duplicate call detected for \(callId) - ignoring")
+           completion?(true)
+           return
+       }
 
-        if canMakeMultipleCalls {
-            activeCalls.values
-                .filter { $0.state == .active }
-                .forEach { call in
-                    logger.info("holding existing \(call.callId)")
-                    callKitManager.setCallOnHold(callId: call.callId, onHold: true)
-                }
-        }
+       if let m = metadata {
+           callMetadata[callId] = m
+           logger.info("metadata cached for \(callId)")
+       }
 
-        var info = CallInfo(callId: callId,
-                            callType: callType,
-                            displayName: displayName,
-                            pictureUrl: pictureUrl,
-                            state: .incoming)
-        activeCalls[callId] = info
-        currentCallId = callId
+       // Check validation but don't return early - always report to CallKit first
+       let hasIncomingCollision = activeCalls.values.contains { $0.state == .incoming }
+       let hasActiveConflict = !canMakeMultipleCalls &&
+                              activeCalls.values.contains { $0.state == .active || $0.state == .held }
 
-        callKitManager.reportIncomingCall(callInfo: info) { error in
-            if let e = error {
-                self.logger.error("reportIncoming failed: \(e.localizedDescription)")
-                self.endCallInternal(callId: callId)
-            }
-        }
-    }
+       let shouldEndImmediately = hasIncomingCollision || hasActiveConflict
+
+       if canMakeMultipleCalls {
+           activeCalls.values
+               .filter { $0.state == .active }
+               .forEach { call in
+                   logger.info("holding existing \(call.callId)")
+                   callKitManager.setCallOnHold(callId: call.callId, onHold: true)
+               }
+       }
+
+       // ALWAYS create and report to CallKit first
+       var info = CallInfo(callId: callId,
+                          callType: callType,
+                          displayName: displayName,
+                          pictureUrl: pictureUrl,
+                          state: .incoming)
+       activeCalls[callId] = info
+       currentCallId = callId
+
+       callKitManager.reportIncomingCall(callInfo: info) { [weak self] error in
+           guard let self = self else {
+               completion?(false)
+               return
+           }
+
+           if let e = error {
+               self.logger.error("reportIncoming failed: \(e.localizedDescription)")
+               self.endCallInternal(callId: callId)
+               completion?(false)
+               return
+           }
+
+           self.logger.info("✅ CallKit successfully reported call \(callId)")
+           completion?(true)
+
+           // Handle validation after CallKit success
+           if shouldEndImmediately {
+               self.logger.info("🔄 Ending call \(callId) due to validation rules")
+
+               if hasIncomingCollision {
+                   self.emitEvent(.callRejected, data: ["callId": callId, "reason": "Another incoming exists"])
+               } else if hasActiveConflict {
+                   self.emitEvent(.callRejected, data: ["callId": callId, "reason": "Another call is active"])
+               }
+
+               DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                   self.callKitManager.endCall(callId: callId)
+               }
+           }
+       }
+   }
 
     // MARK: Outgoing
 

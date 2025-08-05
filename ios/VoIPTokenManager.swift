@@ -60,105 +60,89 @@ class VoIPTokenManager: NSObject, PKPushRegistryDelegate {
 
     // MARK: - PKPushRegistryDelegate
     func pushRegistry(_ registry: PKPushRegistry,
-                          didReceiveIncomingPushWith payload: PKPushPayload,
-                          for type: PKPushType,
-                          completion: @escaping () -> Void)
-    {
-      // 1) Log the full incoming payload
-      let full = payload.dictionaryPayload
-      logger.info("🔔 didReceiveIncomingPush – full payload keys: \(full.keys)")
+                      didReceiveIncomingPushWith payload: PKPushPayload,
+                      for type: PKPushType,
+                      completion: @escaping () -> Void) {
 
-      // 2) Try to extract your custom JSON blob
-      var userInfo: [AnyHashable: Any]?
+        logger.info("🔔 didReceiveIncomingPush started")
 
-      // 2a) Check for a JSON string under aps["data"]
-      if
-        let aps       = full["aps"] as? [AnyHashable: Any],
-        let dataString = aps["data"] as? String,
-        let data       = dataString.data(using: .utf8)
-      {
-        logger.info("🔍 found aps[\"data\"] string (length=\(dataString.count))")
-        do {
-          let obj = try JSONSerialization.jsonObject(with: data, options: [])
-          if let nestedDict = obj as? [AnyHashable: Any] {
-            let keyList = nestedDict.keys.map { "\($0)" }
-            logger.info("🔍 parsed nested payload keys: \(keyList)")
-            userInfo = nestedDict
-          } else {
-            logger.error("❌ parsed aps[\"data\"] but it’s not a dictionary")
-          }
-        } catch {
-          logger.error("❌ failed to JSON-parse aps[\"data\"]: \(error.localizedDescription)")
+        // Add timeout protection
+        let completionTimeout = DispatchWorkItem {
+            self.logger.error("⚠️ VoIP push handling timed out")
+            completion()
         }
-      }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: completionTimeout)
 
-      // 2b) Fallback: top-level “data” dictionary
-      if userInfo == nil,
-         let topData = full["data"] as? [AnyHashable: Any]
-      {
-        logger.info("🔍 found top-level \"data\" dictionary – keys: \(topData.keys)")
-        userInfo = topData
-      }
+        // Extract payload (keep your existing logic)
+        let full = payload.dictionaryPayload
+        logger.info("🔔 didReceiveIncomingPush – full payload keys: \(full.keys)")
 
-      // 2c) Fallback: top-level “payload” dictionary
-      if userInfo == nil,
-         let wrap = full["payload"] as? [AnyHashable: Any]
-      {
-        logger.info("🔍 found top-level \"payload\" dictionary – keys: \(wrap.keys)")
-        userInfo = wrap
-      }
+        var userInfo: [AnyHashable: Any]?
 
-      // 3) Bail if we still have no custom info
-      guard let info = userInfo else {
-        logger.error("❌ invalid payload – no nested info found, full.keys: \(full.keys)")
-        completion() // Call completion immediately if parsing fails
-        return
-      }
-      logger.info("✅ using custom payload keys: \(info.keys)")
+        if let aps = full["aps"] as? [AnyHashable: Any],
+           let dataString = aps["data"] as? String,
+           let data = dataString.data(using: .utf8) {
+            logger.info("🔍 found aps[\"data\"] string (length=\(dataString.count))")
+            do {
+                let obj = try JSONSerialization.jsonObject(with: data, options: [])
+                if let nestedDict = obj as? [AnyHashable: Any] {
+                    let keyList = nestedDict.keys.map { "\($0)" }
+                    logger.info("🔍 parsed nested payload keys: \(keyList)")
+                    userInfo = nestedDict
+                } else {
+                    logger.error("❌ parsed aps[\"data\"] but it's not a dictionary")
+                }
+            } catch {
+                logger.error("❌ failed to JSON-parse aps[\"data\"]: \(error.localizedDescription)")
+            }
+        }
 
-      // 4) Extract required fields (server uses “name” for displayName)
-      guard
-        let callId      = info["callId"]   as? String,
-        let callType    = info["callType"] as? String,
-        let displayName = info["name"]     as? String
-      else {
-        logger.error("❌ missing one of: callId / callType / name in keys: \(info.keys)")
-        completion() // Call completion immediately if essential info is missing
-        return
-      }
+        if userInfo == nil, let topData = full["data"] as? [AnyHashable: Any] {
+            logger.info("🔍 found top-level \"data\" dictionary – keys: \(topData.keys)")
+            userInfo = topData
+        }
 
-      // 5) Optional fields
-      let pictureUrl = info["pictureUrl"] as? String
-                    ?? info["picture"]    as? String
-      let metadata   = info["metadata"]   as? String
-                    ?? info["data"]       as? String
+        if userInfo == nil, let wrap = full["payload"] as? [AnyHashable: Any] {
+            logger.info("🔍 found top-level \"payload\" dictionary – keys: \(wrap.keys)")
+            userInfo = wrap
+        }
 
-      // *** CRITICAL CHANGE: Call completion() here ***
-      // This tells iOS that you have received and processed the push notification,
-      // and it can release the resources allocated for handling it.
-      completion()
-      logger.info("🔔 didReceiveIncomingPush completed (signaled to system, starting background work)")
+        guard let info = userInfo else {
+            logger.error("❌ invalid payload – no nested info found, full.keys: \(full.keys)")
+            completionTimeout.cancel()
+            completion()
+            return
+        }
+        logger.info("✅ using custom payload keys: \(info.keys)")
 
-      // 6) Dispatch to your CallEngine on a background queue.
-      // This ensures that any potentially time-consuming operations within CallEngine
-      // do not block the main thread or delay the completion handler.
-      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-        guard let self = self else { return } // Avoid capturing self strongly in closure
+        guard let callId = info["callId"] as? String,
+              let callType = info["callType"] as? String,
+              let displayName = info["name"] as? String else {
+            logger.error("❌ missing one of: callId / callType / name in keys: \(info.keys)")
+            completionTimeout.cancel()
+            completion()
+            return
+        }
 
-        if let nt = info["type"] as? String, nt == "EndCall" {
-          self.logger.info("📞 VoIP push → EndCall \(callId)")
-          CallEngine.shared.endCall(callId: callId)
-        } else {
-          self.logger.info("📞 VoIP push → IncomingCall \(callId), displayName=\(displayName)")
-          CallEngine.shared.reportIncomingCall(
-            callId:      callId,
-            callType:    callType,
+        let pictureUrl = info["pictureUrl"] as? String ?? info["picture"] as? String
+        let metadata = info["metadata"] as? String ?? info["data"] as? String
+
+        // REMOVED: EndCall VoIP push handling (server won't send these anymore)
+
+        // Handle ONLY incoming calls via VoIP push
+        logger.info("📞 VoIP push → IncomingCall \(callId), displayName=\(displayName)")
+        CallEngine.shared.reportIncomingCall(
+            callId: callId,
+            callType: callType,
             displayName: displayName,
-            pictureUrl:  pictureUrl,
-            metadata:    metadata
-          )
+            pictureUrl: pictureUrl,
+            metadata: metadata
+        ) { [weak self] success in
+            self?.logger.info("📞 CallKit report result: \(success) for \(callId)")
+            completionTimeout.cancel()
+            completion()
         }
-        self.logger.info("🔔 CallEngine work finished for VoIP push")
-      }
+
+        logger.info("🔔 didReceiveIncomingPush dispatch completed")
     }
 }

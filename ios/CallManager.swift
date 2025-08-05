@@ -89,7 +89,8 @@ public class CallManager: HybridCallManagerSpec {
       callType: callType,
       displayName: targetName,
       pictureUrl: nil,
-      metadata: metadata
+      metadata: metadata,
+      completion: nil
     )
   }
 
