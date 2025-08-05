@@ -60,9 +60,9 @@ class VoIPTokenManager: NSObject, PKPushRegistryDelegate {
 
     // MARK: - PKPushRegistryDelegate
     func pushRegistry(_ registry: PKPushRegistry,
-                      didReceiveIncomingPushWith payload: PKPushPayload,
-                      for type: PKPushType,
-                      completion: @escaping () -> Void)
+                          didReceiveIncomingPushWith payload: PKPushPayload,
+                          for type: PKPushType,
+                          completion: @escaping () -> Void)
     {
       // 1) Log the full incoming payload
       let full = payload.dictionaryPayload
@@ -111,7 +111,7 @@ class VoIPTokenManager: NSObject, PKPushRegistryDelegate {
       // 3) Bail if we still have no custom info
       guard let info = userInfo else {
         logger.error("❌ invalid payload – no nested info found, full.keys: \(full.keys)")
-        completion()
+        completion() // Call completion immediately if parsing fails
         return
       }
       logger.info("✅ using custom payload keys: \(info.keys)")
@@ -123,7 +123,7 @@ class VoIPTokenManager: NSObject, PKPushRegistryDelegate {
         let displayName = info["name"]     as? String
       else {
         logger.error("❌ missing one of: callId / callType / name in keys: \(info.keys)")
-        completion()
+        completion() // Call completion immediately if essential info is missing
         return
       }
 
@@ -133,23 +133,32 @@ class VoIPTokenManager: NSObject, PKPushRegistryDelegate {
       let metadata   = info["metadata"]   as? String
                     ?? info["data"]       as? String
 
-      // 6) Dispatch to your CallEngine
-      if let nt = info["type"] as? String, nt == "EndCall" {
-        logger.info("📞 VoIP push → EndCall \(callId)")
-        CallEngine.shared.endCall(callId: callId)
-      } else {
-        logger.info("📞 VoIP push → IncomingCall \(callId), displayName=\(displayName)")
-        CallEngine.shared.reportIncomingCall(
-          callId:      callId,
-          callType:    callType,
-          displayName: displayName,
-          pictureUrl:  pictureUrl,
-          metadata:    metadata
-        )
-      }
-
-      // 7) Call completion
+      // *** CRITICAL CHANGE: Call completion() here ***
+      // This tells iOS that you have received and processed the push notification,
+      // and it can release the resources allocated for handling it.
       completion()
-      logger.info("🔔 didReceiveIncomingPush completed")
+      logger.info("🔔 didReceiveIncomingPush completed (signaled to system, starting background work)")
+
+      // 6) Dispatch to your CallEngine on a background queue.
+      // This ensures that any potentially time-consuming operations within CallEngine
+      // do not block the main thread or delay the completion handler.
+      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        guard let self = self else { return } // Avoid capturing self strongly in closure
+
+        if let nt = info["type"] as? String, nt == "EndCall" {
+          self.logger.info("📞 VoIP push → EndCall \(callId)")
+          CallEngine.shared.endCall(callId: callId)
+        } else {
+          self.logger.info("📞 VoIP push → IncomingCall \(callId), displayName=\(displayName)")
+          CallEngine.shared.reportIncomingCall(
+            callId:      callId,
+            callType:    callType,
+            displayName: displayName,
+            pictureUrl:  pictureUrl,
+            metadata:    metadata
+          )
+        }
+        self.logger.info("🔔 CallEngine work finished for VoIP push")
+      }
     }
 }
