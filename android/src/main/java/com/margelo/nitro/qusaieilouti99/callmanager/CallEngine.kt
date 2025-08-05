@@ -1142,11 +1142,19 @@ object CallEngine {
   }
 
   private fun rejectIncomingCallCollision(callId: String, reason: String) {
-    callMetadata.remove(callId)
     emitEvent(CallEventType.CALL_REJECTED, JSONObject().apply {
       put("callId", callId)
       put("reason", reason)
     })
+
+    // Only remove metadata if there's NO existing active call with this ID
+    val existingCall = activeCalls[callId]
+    if (existingCall == null) {
+      callMetadata.remove(callId)
+      Log.d(TAG, "Removed metadata for rejected call $callId (no existing call)")
+    } else {
+      Log.d(TAG, "Kept metadata for callId: $callId (existing call: ${existingCall.state})")
+    }
   }
 
   private fun createNotificationChannel() {
