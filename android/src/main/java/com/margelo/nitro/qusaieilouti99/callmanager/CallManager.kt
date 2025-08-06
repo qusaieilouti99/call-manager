@@ -8,8 +8,6 @@ class CallManager : HybridCallManagerSpec() {
 
     private val TAG = "CallManager"
 
-    // Simplified approach - rely on proper Application.onCreate() initialization
-    // Remove all fallback context access attempts that don't work with Nitro modules
     private fun ensureInitialized() {
         if (!CallEngine.isInitialized()) {
             Log.e(TAG, "CallEngine not initialized! This should not happen if Application.onCreate() was called properly.")
@@ -19,8 +17,6 @@ class CallManager : HybridCallManagerSpec() {
             )
         }
     }
-
-    // --- All methods must call ensureInitialized() first ---
 
     override fun endCall(callId: String): Unit {
         Log.d(TAG, "endCall requested for callId: $callId")
@@ -83,7 +79,7 @@ class CallManager : HybridCallManagerSpec() {
     override fun callAnswered(callId: String): Unit {
         Log.d(TAG, "callAnswered (from JS) requested for callId: $callId")
         ensureInitialized()
-        CallEngine.callAnsweredFromJS(callId)
+        CallEngine.answerCall(callId, isLocalAnswer = false) // Remote party answered
     }
 
     override fun setOnHold(callId: String, onHold: Boolean): Unit {

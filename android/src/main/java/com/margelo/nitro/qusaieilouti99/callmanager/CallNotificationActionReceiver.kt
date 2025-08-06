@@ -16,14 +16,7 @@ class CallNotificationActionReceiver : BroadcastReceiver() {
         when (intent.action) {
             "com.qusaieilouti99.callmanager.ANSWER_CALL" -> {
                 Log.d(TAG, "Answer action received for callId: $callId")
-                val connection = CallEngine.getTelecomConnection(callId)
-                if (connection != null) {
-                    connection.onAnswer()
-                    Log.d(TAG, "Call answered via Telecom connection for callId: $callId")
-                } else {
-                    Log.e(TAG, "No Telecom connection found for callId: $callId. Using direct answer.")
-                    CallEngine.answerCall(callId)
-                }
+                CallEngine.answerCall(callId, isLocalAnswer = true)
             }
             "com.qusaieilouti99.callmanager.DECLINE_CALL" -> {
                 Log.d(TAG, "Decline action received for callId: $callId")

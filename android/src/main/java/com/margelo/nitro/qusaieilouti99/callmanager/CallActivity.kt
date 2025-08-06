@@ -320,7 +320,9 @@ class CallActivity : Activity(), CallEngine.CallEndListener {
     finishReason = FinishReason.ANSWER
     CallEngine.stopRingtone()
     CallEngine.cancelIncomingCallUI()
-    CallEngine.answerCall(callId)
+
+    // Use the unified answer flow with isLocalAnswer = true
+    CallEngine.answerCall(callId, isLocalAnswer = true)
     finishCallActivity()
   }
 

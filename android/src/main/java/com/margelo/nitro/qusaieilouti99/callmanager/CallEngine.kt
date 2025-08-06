@@ -80,6 +80,7 @@ object CallEngine {
   private val activeCalls = ConcurrentHashMap<String, CallInfo>()
   private val telecomConnections = ConcurrentHashMap<String, Connection>()
   private val callMetadata = ConcurrentHashMap<String, String>()
+  private val callAnswerStates = ConcurrentHashMap<String, Boolean>()
 
   private var currentCallId: String? = null
   private var canMakeMultipleCalls: Boolean = false
@@ -205,10 +206,13 @@ object CallEngine {
 
   fun removeTelecomConnection(callId: String) {
     telecomConnections.remove(callId)
+    callAnswerStates.remove(callId) // Clean up answer state
     Log.d(TAG, "Removed Telecom Connection for callId: $callId")
   }
 
   fun getTelecomConnection(callId: String): Connection? = telecomConnections[callId]
+
+  fun getCallAnswerState(callId: String): Boolean? = callAnswerStates.remove(callId)
 
   fun setCanMakeMultipleCalls(allow: Boolean) {
     canMakeMultipleCalls = allow
@@ -379,85 +383,96 @@ object CallEngine {
     if (existingCallInfo != null && existingCallInfo.state == CallState.INCOMING) {
       // Scenario 1: Call with this ID is already incoming, answer it.
       Log.d(TAG, "Call $callId is incoming, answering it directly via startCall.")
-      answerCall(callId)
-    } else {
-      // Scenario 2: Call is new or not incoming, treat as new outgoing call that is immediately active.
-      Log.d(TAG, "Call $callId is new or not incoming. Initiating as outgoing and immediately active.")
-      if (!canMakeMultipleCalls && activeCalls.isNotEmpty()) { // Only check if multiple calls are not allowed
-          if (!validateOutgoingCallRequest()) {
-              Log.w(TAG, "Rejecting startCall as outgoing - incoming/active call exists")
-              emitEvent(CallEventType.CALL_REJECTED, JSONObject().apply {
-                  put("callId", callId)
-                  put("reason", "Cannot start new active call while incoming or active call exists")
-              })
-              return
-          }
-      }
+      answerCall(callId, isLocalAnswer = false) // Remote party answered
+      return
+    }
 
-      val isVideoCall = callType == "Video"
-      if (!canMakeMultipleCalls && activeCalls.isNotEmpty()) {
-        activeCalls.values.forEach {
-          if (it.state == CallState.ACTIVE) {
-            holdCallInternal(it.callId, heldBySystem = false)
-          }
+    // Scenario 2: Call is new or not incoming, treat as new outgoing call that is immediately active.
+    Log.d(TAG, "Call $callId is new or not incoming. Initiating as outgoing and immediately active.")
+    if (!canMakeMultipleCalls && activeCalls.isNotEmpty()) {
+        if (!validateOutgoingCallRequest()) {
+            Log.w(TAG, "Rejecting startCall as outgoing - incoming/active call exists")
+            emitEvent(CallEventType.CALL_REJECTED, JSONObject().apply {
+                put("callId", callId)
+                put("reason", "Cannot start new active call while incoming or active call exists")
+            })
+            return
         }
-      }
+    }
 
-      activeCalls[callId] = CallInfo(callId, callType, targetName, null, CallState.DIALING) // Temporarily DIALING for Telecom
-      currentCallId = callId
-      Log.d(TAG, "Call $callId added to activeCalls. Initial state: DIALING (for Telecom)")
-
-
-      registerPhoneAccount()
-
-      val telecomManager = requireContext().getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-      val phoneAccountHandle = getPhoneAccountHandle()
-      val addressUri = Uri.fromParts(PhoneAccount.SCHEME_TEL, targetName, null)
-
-      val outgoingExtrasForConnectionService = Bundle().apply {
-        putString(MyConnectionService.EXTRA_CALL_ID, callId)
-        putString(MyConnectionService.EXTRA_CALL_TYPE, callType)
-        putString(MyConnectionService.EXTRA_DISPLAY_NAME, targetName)
-        putBoolean(MyConnectionService.EXTRA_IS_VIDEO_CALL_BOOLEAN, isVideoCall)
-        metadata?.let { putString("metadata", it) }
-      }
-
-      val placeCallExtras = Bundle().apply {
-        putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, phoneAccountHandle)
-        putBundle(TelecomManager.EXTRA_OUTGOING_CALL_EXTRAS, outgoingExtrasForConnectionService)
-        putBoolean(TelecomManager.EXTRA_START_CALL_WITH_SPEAKERPHONE, isVideoCall) // Hint for video calls
-        putInt(TelecomManager.EXTRA_START_CALL_WITH_VIDEO_STATE, if (isVideoCall) VideoProfile.STATE_BIDIRECTIONAL else VideoProfile.STATE_AUDIO_ONLY)
-      }
-
-      try {
-        telecomManager.placeCall(addressUri, placeCallExtras)
-        startForegroundService()
-        bringAppToForeground()
-        keepScreenAwake(true)
-        Log.d(TAG, "Successfully reported outgoing call (to be immediately active) to TelecomManager for $callId")
-
-        // Immediately mark as answered for "startCall" behavior
-        coreCallAnswered(callId, isLocalAnswer = false) // isLocalAnswer = false as it's not a direct answer action from the user on an incoming call.
-      } catch (e: Exception) {
-        Log.e(TAG, "Failed to start call as active: ${e.message}", e)
-        endCallInternal(callId)
+    val isVideoCall = callType == "Video"
+    if (!canMakeMultipleCalls && activeCalls.isNotEmpty()) {
+      activeCalls.values.forEach {
+        if (it.state == CallState.ACTIVE) {
+          holdCallInternal(it.callId, heldBySystem = false)
+        }
       }
     }
 
+    activeCalls[callId] = CallInfo(callId, callType, targetName, null, CallState.DIALING)
+    currentCallId = callId
+    Log.d(TAG, "Call $callId added to activeCalls. Initial state: DIALING (for Telecom)")
+
+    registerPhoneAccount()
+
+    val telecomManager = requireContext().getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+    val phoneAccountHandle = getPhoneAccountHandle()
+    val addressUri = Uri.fromParts(PhoneAccount.SCHEME_TEL, targetName, null)
+
+    val outgoingExtrasForConnectionService = Bundle().apply {
+      putString(MyConnectionService.EXTRA_CALL_ID, callId)
+      putString(MyConnectionService.EXTRA_CALL_TYPE, callType)
+      putString(MyConnectionService.EXTRA_DISPLAY_NAME, targetName)
+      putBoolean(MyConnectionService.EXTRA_IS_VIDEO_CALL_BOOLEAN, isVideoCall)
+      metadata?.let { putString("metadata", it) }
+    }
+
+    val placeCallExtras = Bundle().apply {
+      putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, phoneAccountHandle)
+      putBundle(TelecomManager.EXTRA_OUTGOING_CALL_EXTRAS, outgoingExtrasForConnectionService)
+      putBoolean(TelecomManager.EXTRA_START_CALL_WITH_SPEAKERPHONE, isVideoCall)
+      putInt(TelecomManager.EXTRA_START_CALL_WITH_VIDEO_STATE, if (isVideoCall) VideoProfile.STATE_BIDIRECTIONAL else VideoProfile.STATE_AUDIO_ONLY)
+    }
+
+    try {
+      telecomManager.placeCall(addressUri, placeCallExtras)
+      startForegroundService()
+      bringAppToForeground()
+      keepScreenAwake(true)
+      Log.d(TAG, "Successfully reported outgoing call (to be immediately active) to TelecomManager for $callId")
+
+      // Immediately mark as answered for "startCall" behavior
+      answerCall(callId, isLocalAnswer = false) // Remote party answered
+    } catch (e: Exception) {
+      Log.e(TAG, "Failed to start call as active: ${e.message}", e)
+      endCallInternal(callId)
+    }
     updateLockScreenBypass()
   }
 
-  fun callAnsweredFromJS(callId: String) {
-    Log.d(TAG, "callAnsweredFromJS: $callId - remote party answered")
-    coreCallAnswered(callId, isLocalAnswer = false)
+  // NEW UNIFIED ANSWER METHOD
+  fun answerCall(callId: String, isLocalAnswer: Boolean = true) {
+    Log.d(TAG, "answerCall: $callId, isLocalAnswer: $isLocalAnswer")
+    val callInfo = activeCalls[callId]
+    if (callInfo == null) {
+      Log.w(TAG, "Cannot answer call $callId - not found in active calls")
+      return
+    }
+
+    // Store the isLocalAnswer state for the connection to use
+    callAnswerStates[callId] = isLocalAnswer
+
+    // Always call connection.onAnswer() to let Telecom handle the flow
+    telecomConnections[callId]?.let { connection ->
+      connection.onAnswer() // This will trigger MyConnection.onAnswer()
+    } ?: run {
+      Log.w(TAG, "No telecom connection found for $callId, falling back to direct answer")
+      coreCallAnswered(callId, isLocalAnswer)
+    }
   }
 
-  fun answerCall(callId: String) {
-    Log.d(TAG, "answerCall: $callId - local party answering")
-    coreCallAnswered(callId, isLocalAnswer = true)
-  }
-
-  private fun coreCallAnswered(callId: String, isLocalAnswer: Boolean) {
+  // INTERNAL METHOD called by MyConnection.onAnswer()
+  internal fun coreCallAnswered(callId: String, isLocalAnswer: Boolean) {
     Log.d(TAG, "coreCallAnswered: $callId, isLocalAnswer: $isLocalAnswer")
     val callInfo = activeCalls[callId]
     if (callInfo == null) {
@@ -488,7 +503,7 @@ object CallEngine {
     keepScreenAwake(true)
     updateLockScreenBypass()
 
-    setAudioMode() // Ensure audio mode is correct
+    setAudioMode()
 
     // Set initial audio route using Telecom's CallEndpoint API
     setInitialCallAudioRoute(callId, callInfo.callType)
@@ -613,8 +628,6 @@ object CallEngine {
     setMutedInternal(callId, muted)
   }
 
-  // This method is now called by MyConnection.onMuteStateChanged which receives state from Telecom.
-  // It applies the mute state to AudioManager and emits the event.
   private fun setMutedInternal(callId: String, muted: Boolean) {
     val callInfo = activeCalls[callId]
     if (callInfo == null) {
@@ -628,7 +641,6 @@ object CallEngine {
     val wasMuted = audioManager?.isMicrophoneMute ?: false
     audioManager?.isMicrophoneMute = muted
     Log.d(TAG, "AudioManager microphone mute set to: $muted")
-
 
     if (wasMuted != muted) {
       val eventType = if (muted) CallEventType.CALL_MUTED else CallEventType.CALL_UNMUTED
@@ -653,6 +665,7 @@ object CallEngine {
     activeCalls.clear()
     telecomConnections.clear()
     callMetadata.clear()
+    callAnswerStates.clear()
     currentCallId = null
 
     cleanup()
@@ -669,6 +682,7 @@ object CallEngine {
 
     val metadata = callMetadata.remove(callId)
     activeCalls.remove(callId)
+    callAnswerStates.remove(callId) // Clean up answer state
 
     stopRingback()
     stopRingtone()
@@ -692,7 +706,6 @@ object CallEngine {
     }
 
     telecomConnections[callId]?.let { connection ->
-      // Disconnect and destroy the Telecom Connection
       connection.setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
       connection.destroy()
       removeTelecomConnection(callId)
@@ -727,14 +740,12 @@ object CallEngine {
 
   // ====== IMPROVED AUDIO ROUTING SYSTEM (using CallEndpoint API) ======
 
-  // Stores the currently available CallEndpoints as reported by Telecom
   fun onTelecomAvailableEndpointsChanged(endpoints: List<CallEndpoint>) {
       availableCallEndpoints = endpoints
       Log.d(TAG, "Available CallEndpoints updated: ${endpoints.map { "${it.endpointName}(${mapCallEndpointTypeToString(it.endpointType)})" }}")
       emitAudioDevicesChanged()
   }
 
-  // Stores the active CallEndpoint as reported by Telecom
   fun onTelecomAudioRouteChanged(callId: String, callEndpoint: CallEndpoint) {
       Log.d(TAG, "Telecom audio route changed for $callId: endpoint=${callEndpoint.endpointName} (type=${mapCallEndpointTypeToString(callEndpoint.endpointType)})")
       currentActiveCallEndpoint = callEndpoint
@@ -744,9 +755,6 @@ object CallEngine {
   fun getAudioDevices(): AudioRoutesInfo {
     val devices = availableCallEndpoints.map { StringHolder(mapCallEndpointTypeToString(it.endpointType)) }.toMutableSet()
 
-    // Add common fallback endpoints if Telecom doesn't explicitly list them,
-    // although for active calls, Telecom should provide comprehensive lists.
-    // This provides robustness for the JavaScript side's expected string values.
     if (!devices.any { it.value == "Earpiece" }) devices.add(StringHolder("Earpiece"))
     if (!devices.any { it.value == "Speaker" }) devices.add(StringHolder("Speaker"))
 
@@ -762,9 +770,8 @@ object CallEngine {
 
      val telecomEndpointType = mapStringToCallEndpointType(route)
 
-     // Find the actual CallEndpoint object from the available list that matches the type
      val targetEndpoint = availableCallEndpoints.find { it.endpointType == telecomEndpointType }
-         ?: getOrCreateGenericCallEndpoint(telecomEndpointType, route) // Fallback to create generic if not found in available list
+         ?: getOrCreateGenericCallEndpoint(telecomEndpointType, route)
 
      if (targetEndpoint != null) {
          currentCallId?.let { callId ->
@@ -782,7 +789,6 @@ object CallEngine {
      }
  }
 
-  // This method is called by MyConnection when its state becomes ACTIVE, or after startCall/startOutgoingCall.
   fun setInitialCallAudioRoute(callId: String, callType: String) {
       Log.d(TAG, "Setting initial audio route for callId: $callId, type: $callType")
 
@@ -798,9 +804,6 @@ object CallEngine {
           else -> CallEndpoint.TYPE_EARPIECE
       }
 
-      // We should ideally pick from `availableCallEndpoints`.
-      // If none of that type are explicitly listed (e.g. for default Earpiece/Speaker),
-      // we can try to create a generic one.
       val targetEndpoint = availableCallEndpoints.find { it.endpointType == targetEndpointType }
           ?: getOrCreateGenericCallEndpoint(targetEndpointType, mapCallEndpointTypeToString(targetEndpointType))
 
@@ -812,7 +815,7 @@ object CallEngine {
                       connection.setTelecomAudioRoute(targetEndpoint)
                   }
               } ?: Log.w(TAG, "No telecom connection found for $callId during initial route setting.")
-          }, 500L) // Small delay to allow Telecom to process connection activation
+          }, 500L)
       } else {
           Log.w(TAG, "Could not find or create a valid CallEndpoint for initial route type: $targetEndpointType")
       }
@@ -832,8 +835,8 @@ object CallEngine {
         }
         am.isSpeakerphoneOn = false
       }
-      currentActiveCallEndpoint = null // Reset active endpoint
-      availableCallEndpoints = emptyList() // Clear available endpoints
+      currentActiveCallEndpoint = null
+      availableCallEndpoints = emptyList()
       wasManuallySetAudioRoute = false
       Log.d(TAG, "Audio mode reset to MODE_NORMAL, audio endpoints reset.")
     }
@@ -862,8 +865,6 @@ object CallEngine {
   }
 
   private fun getOrCreateGenericCallEndpoint(type: Int, name: String): CallEndpoint? {
-      // This is a fallback to create a CallEndpoint if it's not explicitly in availableCallEndpoints.
-      // Useful for basic types like Earpiece/Speaker that might implicitly exist.
       return when (type) {
           CallEndpoint.TYPE_EARPIECE -> CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Earpiece_Default".toByteArray())))
           CallEndpoint.TYPE_SPEAKER -> CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Speaker_Default".toByteArray())))
@@ -872,7 +873,6 @@ object CallEngine {
           else -> null
       }
   }
-
 
   private fun isWiredHeadsetConnected(): Boolean {
     val am = audioManager ?: return false
@@ -905,7 +905,7 @@ object CallEngine {
   }
 
   private fun emitAudioRouteChanged(currentRoute: String) {
-      val info = getAudioDevices() // This now uses CallEngine's internal state
+      val info = getAudioDevices()
       val deviceStrings = info.devices.map { it.value }
       val payload = JSONObject().apply {
           put("devices", JSONArray(deviceStrings))
@@ -926,10 +926,6 @@ object CallEngine {
     Log.d(TAG, "Audio devices changed: available: $deviceStrings")
   }
 
-  // Audio device callbacks are now handled by Telecom and MyConnection.
-  // The CallEngine does not directly register an AudioDeviceCallback.
-  // This part of the code is removed.
-
   // ====== END IMPROVED AUDIO ROUTING SYSTEM ======
 
   fun keepScreenAwake(keepAwake: Boolean) {
@@ -937,13 +933,10 @@ object CallEngine {
     val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
     if (keepAwake) {
       if (wakeLock == null || wakeLock!!.isHeld.not()) {
-        // Use PARTIAL_WAKE_LOCK to keep CPU awake, SCREEN_DIM_WAKE_LOCK to keep screen on (dim)
-        // For general "keep screen awake", SCREEN_DIM_WAKE_LOCK is appropriate.
         wakeLock = powerManager.newWakeLock(
           PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
           "CallEngine:WakeLock"
         )
-        // Set a timeout for the wakelock to prevent indefinite drain, e.g., 10 minutes
         wakeLock?.acquire(10 * 60 * 1000L)
         Log.d(TAG, "Acquired SCREEN_DIM_WAKE_LOCK")
       }
@@ -968,12 +961,10 @@ object CallEngine {
   }
 
   private fun validateOutgoingCallRequest(): Boolean {
-    // Only allow outgoing call if no incoming or active call exists and multi-call not allowed
     return !activeCalls.any {
       (!canMakeMultipleCalls && (it.value.state == CallState.INCOMING || it.value.state == CallState.ACTIVE))
     }
   }
-
 
   private fun rejectIncomingCallCollision(callId: String, reason: String) {
     emitEvent(CallEventType.CALL_REJECTED, JSONObject().apply {
@@ -981,7 +972,6 @@ object CallEngine {
       put("reason", reason)
     })
 
-    // Only remove metadata if there's NO existing active call with this ID
     val existingCall = activeCalls[callId]
     if (existingCall == null) {
       callMetadata.remove(callId)
@@ -1005,12 +995,6 @@ object CallEngine {
       channel.enableVibration(true)
       channel.setBypassDnd(true)
       channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-
-      // For Android S (API 31) and above, Telecom manages ringing for self-managed calls
-      // if it's the default dialer or an InCallService with METADATA_IN_CALL_SERVICE_RINGING.
-      // Setting sound to null here allows Telecom to take over or for us to manage manually
-      // if not relying on Telecom for ringing.
-      // Since we play ringtone manually below, ensure channel sound is null to avoid double ringing.
       channel.setSound(null, null)
       channel.importance = NotificationManager.IMPORTANCE_HIGH
 
@@ -1026,12 +1010,11 @@ object CallEngine {
     val useCallStyleNotification = supportsCallStyleNotifications()
     Log.d(TAG, "Using CallStyle notification: $useCallStyleNotification")
 
-    // Determine if device is locked or if CallStyle is not preferred/supported for current scenario
     val isDeviceLocked = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
         val keyguardManager = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
         keyguardManager.isKeyguardLocked
     } else {
-        false // Older APIs, assume no direct lock screen check needed or handled differently
+        false
     }
 
     if (isDeviceLocked || !useCallStyleNotification) {
@@ -1065,7 +1048,7 @@ object CallEngine {
         PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
         "CallEngine:LockScreenWake"
       )
-      wakeLock.acquire(5000) // Acquire for a short duration
+      wakeLock.acquire(5000)
       context.startActivity(overlayIntent)
       Log.d(TAG, "Successfully launched CallActivity overlay")
     } catch (e: Exception) {
@@ -1129,7 +1112,7 @@ object CallEngine {
         .setCategory(Notification.CATEGORY_CALL)
         .setPriority(Notification.PRIORITY_MAX)
         .setVisibility(Notification.VISIBILITY_PUBLIC)
-        .setSound(null) // No sound for CallStyle, we manage it separately
+        .setSound(null)
         .build()
     } else {
       Notification.Builder(context, NOTIF_CHANNEL_ID)
@@ -1144,7 +1127,7 @@ object CallEngine {
         .setOngoing(true)
         .setAutoCancel(false)
         .setVisibility(Notification.VISIBILITY_PUBLIC)
-        .setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)) // Fallback for older styles
+        .setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE))
         .build()
     }
 
@@ -1198,12 +1181,10 @@ object CallEngine {
     val activityManager =
       context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
 
-    // For API 23+, getRunningTasks is deprecated. Use UsageStatsManager or check AppTasks
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) { // LMR1 is API 22, getAppTasks available from API 21, but getRunningTasks deprecated from API 23.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
       try {
         val tasks = activityManager.appTasks
         if (tasks.isNotEmpty()) {
-          // get(0) is the top-most task
           val topActivityComponentName = tasks[0].taskInfo.topActivity
           return topActivityComponentName?.className?.contains("MainActivity") == true
         }
@@ -1369,6 +1350,7 @@ object CallEngine {
     activeCalls.clear()
     telecomConnections.clear()
     callMetadata.clear()
+    callAnswerStates.clear()
     currentCallId = null
     cleanup()
     lockScreenBypassCallbacks.clear()
@@ -1376,7 +1358,6 @@ object CallEngine {
     cachedEvents.clear()
     isInitialized.set(false)
     appContext = null
-    // Reset audio states
     currentActiveCallEndpoint = null
     availableCallEndpoints = emptyList()
     wasManuallySetAudioRoute = false

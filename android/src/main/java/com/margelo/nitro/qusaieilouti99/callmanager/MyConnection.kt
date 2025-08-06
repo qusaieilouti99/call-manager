@@ -49,7 +49,10 @@ class MyConnection(
         super.onAnswer(videoState)
         Log.d(TAG, "Call answered via Telecom for callId: $callId. VideoState: $videoState")
         setActive()
-        CallEngine.answerCall(callId)
+
+        // Retrieve the stored isLocalAnswer state and call coreCallAnswered directly
+        val isLocalAnswer = CallEngine.getCallAnswerState(callId) ?: true // default to true if not found
+        CallEngine.coreCallAnswered(callId, isLocalAnswer)
     }
 
     override fun onReject() {
