@@ -123,4 +123,11 @@ class CallManager : HybridCallManagerSpec() {
           metadata
         )
     }
+
+    // --- New Hybrid Method for SYSTEM_ALERT_WINDOW permission ---
+    override fun requestOverlayPermissionAndroid(): Boolean {
+        Log.d(TAG, "requestOverlayPermissionAndroid requested")
+        ensureInitialized()
+        return CallEngine.requestOverlayPermission()
+    }
 }

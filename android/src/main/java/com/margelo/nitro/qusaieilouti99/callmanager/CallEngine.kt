@@ -38,6 +38,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import android.app.KeyguardManager
 import java.util.UUID
+import android.provider.Settings // Import for Settings.canDrawOverlays and ACTION_MANAGE_OVERLAY_PERMISSION
 
 /**
  * Core call‐management engine. Manages self-managed telecom calls,
@@ -1043,6 +1044,16 @@ object CallEngine {
     }
 
     try {
+      // For SYSTEM_ALERT_WINDOW usage, the permission must be granted.
+      // We are checking it in requestOverlayPermission.
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(context)) {
+          Log.w(TAG, "Cannot show CallActivity overlay without SYSTEM_ALERT_WINDOW permission. Launching permission request.")
+          // Instead of starting the activity which will fail, launch the permission request.
+          requestOverlayPermission()
+          showStandardNotification(context, callId, callerName, callType, callerPicUrl)
+          return
+      }
+
       val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
       val wakeLock = powerManager.newWakeLock(
         PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
@@ -1361,5 +1372,36 @@ object CallEngine {
     currentActiveCallEndpoint = null
     availableCallEndpoints = emptyList()
     wasManuallySetAudioRoute = false
+  }
+
+  // --- New Function for SYSTEM_ALERT_WINDOW permission ---
+  fun requestOverlayPermission(): Boolean {
+    val context = requireContext()
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+      if (!Settings.canDrawOverlays(context)) {
+        Log.d(TAG, "SYSTEM_ALERT_WINDOW permission not granted. Requesting it.")
+        try {
+          val intent = Intent(
+            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            Uri.parse("package:" + context.packageName)
+          ).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) // Required when starting from non-Activity context
+          }
+          context.startActivity(intent)
+          Log.d(TAG, "Launched SYSTEM_ALERT_WINDOW permission settings.")
+          false // Not granted yet, user needs to act
+        } catch (e: Exception) {
+          Log.e(TAG, "Failed to launch SYSTEM_ALERT_WINDOW permission settings: ${e.message}", e)
+          false // Failed to launch, so not granted
+        }
+      } else {
+        Log.d(TAG, "SYSTEM_ALERT_WINDOW permission already granted.")
+        true
+      }
+    } else {
+      // Permissions granted at install time for older Android versions
+      Log.d(TAG, "SYSTEM_ALERT_WINDOW permission automatically granted on API < 23.")
+      true
+    }
   }
 }

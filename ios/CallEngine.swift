@@ -25,6 +25,9 @@ class CallEngine {
     // Track video calls that need speaker activation
     private var videoCallsNeedingSpeaker: Set<String> = []
 
+    // NEW: Track calls being answered via the startCall method
+    private var answeringIncomingViaStartCall: Set<String> = [] // NEW
+
     private init() {
         logger.info("CallEngine singleton created")
     }
@@ -200,6 +203,30 @@ class CallEngine {
                    metadata: String? = nil)
     {
         logger.info("startCall (join ongoing): \(callId), type=\(callType)")
+
+        // --- MODIFICATION START ---
+        // Check if the callId corresponds to an existing incoming call
+        if let existingCallInfo = activeCalls[callId], existingCallInfo.state == .incoming {
+            logger.info("startCall: Detected attempt to answer existing incoming call \(callId). Redirecting to answer flow.")
+
+            // Update metadata for the existing incoming call if provided
+            if let m = metadata {
+                callMetadata[callId] = m
+                logger.info("metadata updated for incoming call \(callId)")
+            }
+
+            // Mark this call as one being answered via startCall
+            answeringIncomingViaStartCall.insert(callId)
+
+            // Trigger the CallKit answer action. This will lead to `callKitManager(_:didAnswerCall:)` being called.
+            callKitManager.answerCall(callId: callId)
+
+            // Return early as we've redirected to the answer flow.
+            return
+        }
+        // --- MODIFICATION END ---
+
+
         if let m = metadata {
             callMetadata[callId] = m
             logger.info("metadata cached for \(callId)")
@@ -447,7 +474,16 @@ class CallEngine {
 
 extension CallEngine: CallKitManagerDelegate {
     func callKitManager(_ manager: CallKitManager, didAnswerCall callId: String) {
-        coreCallAnswered(callId: callId, isLocalAnswer: true)
+        // MODIFICATION START
+        if answeringIncomingViaStartCall.contains(callId) {
+            logger.info("📞 CallKit answered: \(callId). This was initiated by startCall, treating as non-local answer.")
+            answeringIncomingViaStartCall.remove(callId)
+            coreCallAnswered(callId: callId, isLocalAnswer: false) // isLocalAnswer: false for OUTGOING_CALL_ANSWERED
+        } else {
+            logger.info("📞 CallKit answered: \(callId). Standard local answer.")
+            coreCallAnswered(callId: callId, isLocalAnswer: true) // isLocalAnswer: true for CALL_ANSWERED
+        }
+        // MODIFICATION END
     }
 
     func callKitManager(_ manager: CallKitManager, didEndCall callId: String) {
