@@ -1,5 +1,5 @@
 package com.margelo.nitro.qusaieilouti99.callmanager
-import android.telecom.CallAudioState
+
 import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
@@ -10,8 +10,6 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.media.AudioAttributes
-import android.media.AudioDeviceCallback
-import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.RingtoneManager
@@ -21,11 +19,17 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.ParcelUuid
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.telecom.CallAudioState
+import android.telecom.CallEndpoint
 import android.telecom.Connection
 import android.telecom.DisconnectCause
 import android.telecom.PhoneAccount
 import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
+import android.telecom.VideoProfile
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
@@ -33,18 +37,14 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import android.app.KeyguardManager
-import android.os.Vibrator
-import android.os.VibrationEffect
+import java.util.UUID
 
 /**
  * Core call‐management engine. Manages self-managed telecom calls,
  * audio routing, UI notifications, etc.
  *
- * Audio routing follows Android standards:
- * - Audio calls default to earpiece unless BT/headset connected
- * - Video calls default to speaker unless BT/headset connected
- * - System handles route changes when devices connect/disconnect
- * - Manual route changes are always respected
+ * Audio routing now primarily leverages Android Telecom's CallEndpoint API (API 34+),
+ * allowing the system to manage the underlying audio device changes.
  */
 object CallEngine {
   private const val TAG = "CallEngine"
@@ -88,9 +88,10 @@ object CallEngine {
   private var eventHandler: ((CallEventType, String) -> Unit)? = null
   private val cachedEvents = mutableListOf<Pair<CallEventType, String>>()
 
-  // Audio routing state
-  private var currentAudioRoute: String = "Earpiece"
-  private var wasManuallySet: Boolean = false
+  // Audio routing state for CallEndpoint API (API 34+)
+  private var currentActiveCallEndpoint: CallEndpoint? = null
+  private var availableCallEndpoints: List<CallEndpoint> = emptyList()
+  private var wasManuallySetAudioRoute: Boolean = false
   private var callStartTime: Long = 0
 
   interface LockScreenBypassCallback {
@@ -144,6 +145,7 @@ object CallEngine {
   }
 
   private fun supportsCallStyleNotifications(): Boolean {
+    // CallStyle notifications are available from Android S (API 31)
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
 
     val manufacturer = Build.MANUFACTURER.lowercase()
@@ -244,12 +246,12 @@ object CallEngine {
       return
     }
 
-    val activeCall = activeCalls.values.find {
+    val activeOrHeldCall = activeCalls.values.find {
       it.state == CallState.ACTIVE || it.state == CallState.HELD
     }
-    if (activeCall != null && !canMakeMultipleCalls) {
-      Log.d(TAG, "Active call exists when receiving incoming call. Auto-rejecting: $callId")
-      rejectIncomingCallCollision(callId, "Another call is already active")
+    if (activeOrHeldCall != null && !canMakeMultipleCalls) {
+      Log.d(TAG, "Active/Held call exists when receiving incoming call. Auto-rejecting: $callId")
+      rejectIncomingCallCollision(callId, "Another call is already active or held")
       return
     }
 
@@ -279,6 +281,8 @@ object CallEngine {
       putString(MyConnectionService.EXTRA_DISPLAY_NAME, displayName)
       putBoolean(MyConnectionService.EXTRA_IS_VIDEO_CALL_BOOLEAN, isVideoCall)
       pictureUrl?.let { putString(MyConnectionService.EXTRA_PICTURE_URL, it) }
+      // TelecomManager.EXTRA_INCOMING_VIDEO_STATE is used here to hint the video state to Telecom
+      putInt(TelecomManager.EXTRA_INCOMING_VIDEO_STATE, if (isVideoCall) VideoProfile.STATE_BIDIRECTIONAL else VideoProfile.STATE_AUDIO_ONLY)
     }
 
     try {
@@ -325,7 +329,6 @@ object CallEngine {
     currentCallId = callId
     Log.d(TAG, "Call $callId added to activeCalls. State: DIALING")
 
-    setAudioMode()
     registerPhoneAccount()
 
     val telecomManager =
@@ -333,7 +336,7 @@ object CallEngine {
     val phoneAccountHandle = getPhoneAccountHandle()
     val addressUri = Uri.fromParts(PhoneAccount.SCHEME_TEL, targetName, null)
 
-    val outgoingExtras = Bundle().apply {
+    val outgoingExtrasForConnectionService = Bundle().apply {
       putString(MyConnectionService.EXTRA_CALL_ID, callId)
       putString(MyConnectionService.EXTRA_CALL_TYPE, callType)
       putString(MyConnectionService.EXTRA_DISPLAY_NAME, targetName)
@@ -341,16 +344,17 @@ object CallEngine {
       metadata?.let { putString("metadata", it) }
     }
 
-    val extras = Bundle().apply {
+    val placeCallExtras = Bundle().apply {
       putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, phoneAccountHandle)
-      putBundle(TelecomManager.EXTRA_OUTGOING_CALL_EXTRAS, outgoingExtras)
+      putBundle(TelecomManager.EXTRA_OUTGOING_CALL_EXTRAS, outgoingExtrasForConnectionService)
+      // Hint to Telecom whether to start with speakerphone based on video call type
       putBoolean(TelecomManager.EXTRA_START_CALL_WITH_SPEAKERPHONE, isVideoCall)
+      putInt(TelecomManager.EXTRA_START_CALL_WITH_VIDEO_STATE, if (isVideoCall) VideoProfile.STATE_BIDIRECTIONAL else VideoProfile.STATE_AUDIO_ONLY)
     }
 
     try {
-      telecomManager.placeCall(addressUri, extras)
+      telecomManager.placeCall(addressUri, placeCallExtras)
       startForegroundService()
-      startRingback()
       bringAppToForeground()
       keepScreenAwake(true)
       Log.d(TAG, "Successfully reported outgoing call to TelecomManager")
@@ -371,42 +375,76 @@ object CallEngine {
     Log.d(TAG, "startCall: callId=$callId, type=$callType, target=$targetName")
     metadata?.let { callMetadata[callId] = it }
 
-    if (activeCalls.containsKey(callId)) {
-      Log.w(TAG, "Call $callId already exists, cannot start again")
-      return
-    }
+    val existingCallInfo = activeCalls[callId]
+    if (existingCallInfo != null && existingCallInfo.state == CallState.INCOMING) {
+      // Scenario 1: Call with this ID is already incoming, answer it.
+      Log.d(TAG, "Call $callId is incoming, answering it directly via startCall.")
+      answerCall(callId)
+    } else {
+      // Scenario 2: Call is new or not incoming, treat as new outgoing call that is immediately active.
+      Log.d(TAG, "Call $callId is new or not incoming. Initiating as outgoing and immediately active.")
+      if (!canMakeMultipleCalls && activeCalls.isNotEmpty()) { // Only check if multiple calls are not allowed
+          if (!validateOutgoingCallRequest()) {
+              Log.w(TAG, "Rejecting startCall as outgoing - incoming/active call exists")
+              emitEvent(CallEventType.CALL_REJECTED, JSONObject().apply {
+                  put("callId", callId)
+                  put("reason", "Cannot start new active call while incoming or active call exists")
+              })
+              return
+          }
+      }
 
-    if (!canMakeMultipleCalls && activeCalls.isNotEmpty()) {
-      activeCalls.values.forEach {
-        if (it.state == CallState.ACTIVE) {
-          holdCallInternal(it.callId, heldBySystem = false)
+      val isVideoCall = callType == "Video"
+      if (!canMakeMultipleCalls && activeCalls.isNotEmpty()) {
+        activeCalls.values.forEach {
+          if (it.state == CallState.ACTIVE) {
+            holdCallInternal(it.callId, heldBySystem = false)
+          }
         }
+      }
+
+      activeCalls[callId] = CallInfo(callId, callType, targetName, null, CallState.DIALING) // Temporarily DIALING for Telecom
+      currentCallId = callId
+      Log.d(TAG, "Call $callId added to activeCalls. Initial state: DIALING (for Telecom)")
+
+
+      registerPhoneAccount()
+
+      val telecomManager = requireContext().getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+      val phoneAccountHandle = getPhoneAccountHandle()
+      val addressUri = Uri.fromParts(PhoneAccount.SCHEME_TEL, targetName, null)
+
+      val outgoingExtrasForConnectionService = Bundle().apply {
+        putString(MyConnectionService.EXTRA_CALL_ID, callId)
+        putString(MyConnectionService.EXTRA_CALL_TYPE, callType)
+        putString(MyConnectionService.EXTRA_DISPLAY_NAME, targetName)
+        putBoolean(MyConnectionService.EXTRA_IS_VIDEO_CALL_BOOLEAN, isVideoCall)
+        metadata?.let { putString("metadata", it) }
+      }
+
+      val placeCallExtras = Bundle().apply {
+        putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, phoneAccountHandle)
+        putBundle(TelecomManager.EXTRA_OUTGOING_CALL_EXTRAS, outgoingExtrasForConnectionService)
+        putBoolean(TelecomManager.EXTRA_START_CALL_WITH_SPEAKERPHONE, isVideoCall) // Hint for video calls
+        putInt(TelecomManager.EXTRA_START_CALL_WITH_VIDEO_STATE, if (isVideoCall) VideoProfile.STATE_BIDIRECTIONAL else VideoProfile.STATE_AUDIO_ONLY)
+      }
+
+      try {
+        telecomManager.placeCall(addressUri, placeCallExtras)
+        startForegroundService()
+        bringAppToForeground()
+        keepScreenAwake(true)
+        Log.d(TAG, "Successfully reported outgoing call (to be immediately active) to TelecomManager for $callId")
+
+        // Immediately mark as answered for "startCall" behavior
+        coreCallAnswered(callId, isLocalAnswer = false) // isLocalAnswer = false as it's not a direct answer action from the user on an incoming call.
+      } catch (e: Exception) {
+        Log.e(TAG, "Failed to start call as active: ${e.message}", e)
+        endCallInternal(callId)
       }
     }
 
-    activeCalls[callId] =
-      CallInfo(callId, callType, targetName, null, CallState.ACTIVE)
-    currentCallId = callId
-    callStartTime = System.currentTimeMillis()
-    wasManuallySet = false
-    Log.d(TAG, "Call $callId started as ACTIVE")
-
-    registerPhoneAccount()
-    setAudioMode()
-    bringAppToForeground()
-    startForegroundService()
-    keepScreenAwake(true)
-
-    // Register audio device callback to handle dynamic device changes
-    registerAudioDeviceCallback()
-
-    // Set initial audio route based on call type and available devices
-    mainHandler.postDelayed({
-      setInitialAudioRoute(callType)
-    }, 500L)
-
     updateLockScreenBypass()
-    emitOutgoingCallAnsweredWithMetadata(callId)
   }
 
   fun callAnsweredFromJS(callId: String) {
@@ -430,7 +468,7 @@ object CallEngine {
     activeCalls[callId] = callInfo.copy(state = CallState.ACTIVE)
     currentCallId = callId
     callStartTime = System.currentTimeMillis()
-    wasManuallySet = false
+    wasManuallySetAudioRoute = false
     Log.d(TAG, "Call $callId set to ACTIVE state")
 
     stopRingtone()
@@ -450,15 +488,10 @@ object CallEngine {
     keepScreenAwake(true)
     updateLockScreenBypass()
 
-    setAudioMode()
+    setAudioMode() // Ensure audio mode is correct
 
-    // Register audio device callback to handle dynamic device changes
-    registerAudioDeviceCallback()
-
-    // Set initial audio route with proper timing
-    mainHandler.postDelayed({
-      setInitialAudioRoute(callInfo.callType)
-    }, 800L)
+    // Set initial audio route using Telecom's CallEndpoint API
+    setInitialCallAudioRoute(callId, callInfo.callType)
 
     if (isLocalAnswer) {
       emitCallAnsweredWithMetadata(callId)
@@ -580,6 +613,8 @@ object CallEngine {
     setMutedInternal(callId, muted)
   }
 
+  // This method is now called by MyConnection.onMuteStateChanged which receives state from Telecom.
+  // It applies the mute state to AudioManager and emits the event.
   private fun setMutedInternal(callId: String, muted: Boolean) {
     val callInfo = activeCalls[callId]
     if (callInfo == null) {
@@ -592,6 +627,8 @@ object CallEngine {
 
     val wasMuted = audioManager?.isMicrophoneMute ?: false
     audioManager?.isMicrophoneMute = muted
+    Log.d(TAG, "AudioManager microphone mute set to: $muted")
+
 
     if (wasMuted != muted) {
       val eventType = if (muted) CallEventType.CALL_MUTED else CallEventType.CALL_UNMUTED
@@ -655,6 +692,7 @@ object CallEngine {
     }
 
     telecomConnections[callId]?.let { connection ->
+      // Disconnect and destroy the Telecom Connection
       connection.setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
       connection.destroy()
       removeTelecomConnection(callId)
@@ -687,262 +725,97 @@ object CallEngine {
     })
   }
 
-  // ====== IMPROVED AUDIO ROUTING SYSTEM ======
+  // ====== IMPROVED AUDIO ROUTING SYSTEM (using CallEndpoint API) ======
+
+  // Stores the currently available CallEndpoints as reported by Telecom
+  fun onTelecomAvailableEndpointsChanged(endpoints: List<CallEndpoint>) {
+      availableCallEndpoints = endpoints
+      Log.d(TAG, "Available CallEndpoints updated: ${endpoints.map { "${it.endpointName}(${mapCallEndpointTypeToString(it.endpointType)})" }}")
+      emitAudioDevicesChanged()
+  }
+
+  // Stores the active CallEndpoint as reported by Telecom
+  fun onTelecomAudioRouteChanged(callId: String, callEndpoint: CallEndpoint) {
+      Log.d(TAG, "Telecom audio route changed for $callId: endpoint=${callEndpoint.endpointName} (type=${mapCallEndpointTypeToString(callEndpoint.endpointType)})")
+      currentActiveCallEndpoint = callEndpoint
+      emitAudioRouteChanged(mapCallEndpointTypeToString(callEndpoint.endpointType))
+  }
 
   fun getAudioDevices(): AudioRoutesInfo {
-    val context = requireContext()
-    audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-      ?: return AudioRoutesInfo(emptyArray(), "Unknown")
+    val devices = availableCallEndpoints.map { StringHolder(mapCallEndpointTypeToString(it.endpointType)) }.toMutableSet()
 
-    val devices = mutableSetOf<String>()
-    var hasWiredHeadset = false
-    var hasBluetoothDevice = false
+    // Add common fallback endpoints if Telecom doesn't explicitly list them,
+    // although for active calls, Telecom should provide comprehensive lists.
+    // This provides robustness for the JavaScript side's expected string values.
+    if (!devices.any { it.value == "Earpiece" }) devices.add(StringHolder("Earpiece"))
+    if (!devices.any { it.value == "Speaker" }) devices.add(StringHolder("Speaker"))
 
-    // Always available
-    devices.add("Earpiece")
-    devices.add("Speaker")
-
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-      val outputDevices = audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS) ?: emptyArray()
-      for (device in outputDevices) {
-        when (device.type) {
-          AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
-          AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> {
-            if (!hasBluetoothDevice) {
-              devices.add("Bluetooth")
-              hasBluetoothDevice = true
-            }
-          }
-          AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
-          AudioDeviceInfo.TYPE_WIRED_HEADSET,
-          AudioDeviceInfo.TYPE_USB_HEADSET -> {
-            if (!hasWiredHeadset) {
-              devices.add("Headset")
-              hasWiredHeadset = true
-            }
-          }
-          AudioDeviceInfo.TYPE_BLE_HEADSET -> {
-            if (!hasBluetoothDevice) {
-              devices.add("Bluetooth")
-              hasBluetoothDevice = true
-            }
-          }
-        }
-      }
-    } else {
-      // Fallback for older API levels
-      @Suppress("DEPRECATION")
-      if (audioManager?.isBluetoothA2dpOn == true || audioManager?.isBluetoothScoOn == true) {
-        devices.add("Bluetooth")
-        hasBluetoothDevice = true
-      }
-      @Suppress("DEPRECATION")
-      if (audioManager?.isWiredHeadsetOn == true) {
-        devices.add("Headset")
-        hasWiredHeadset = true
-      }
-    }
-
-    val current = getCurrentAudioRoute()
+    val current = currentActiveCallEndpoint?.let { mapCallEndpointTypeToString(it.endpointType) } ?: "Unknown"
     Log.d(TAG, "Available audio devices: ${devices.toList()}, current: $current")
 
-    val deviceHolders = devices.map { StringHolder(it) }.toTypedArray()
-    return AudioRoutesInfo(deviceHolders, current)
+    return AudioRoutesInfo(devices.toTypedArray(), current)
   }
 
-  // NEW: Handle telecom audio route changes
-  fun onTelecomAudioRouteChanged(callId: String, audioState: CallAudioState) {
-      Log.d(TAG, "Telecom audio route changed for $callId: route=${audioState.route}")
-
-      val routeString = when (audioState.route) {
-          CallAudioState.ROUTE_EARPIECE -> "Earpiece"
-          CallAudioState.ROUTE_SPEAKER -> "Speaker"
-          CallAudioState.ROUTE_BLUETOOTH -> "Bluetooth"
-          CallAudioState.ROUTE_WIRED_HEADSET -> "Headset"
-          else -> "Unknown"
-      }
-
-      Log.d(TAG, "Emitting AUDIO_ROUTE_CHANGED: currentRoute=$routeString")
-      emitAudioRouteChanged(routeString)
-  }
-
-  // NEW: Set initial audio route using telecom
-  fun setInitialAudioRouteForCall(callId: String, callType: String) {
-      Log.d(TAG, "Setting initial audio route for $callId, type: $callType")
-
-      // Determine the desired route
-      val desiredRoute = when {
-          isBluetoothDeviceConnected() -> CallAudioState.ROUTE_BLUETOOTH
-          isWiredHeadsetConnected() -> CallAudioState.ROUTE_WIRED_HEADSET
-          callType.equals("Video", ignoreCase = true) -> CallAudioState.ROUTE_SPEAKER
-          else -> CallAudioState.ROUTE_EARPIECE
-      }
-
-      // Use telecom connection to set the route
-      telecomConnections[callId]?.let { connection ->
-          if (connection is MyConnection) {
-              mainHandler.postDelayed({
-                  connection.setTelecomAudioRoute(desiredRoute)
-                  Log.d(TAG, "Set initial telecom audio route to: $desiredRoute")
-              }, 200)
-          }
-      }
-  }
-
- // UPDATED: Use telecom for manual route changes
   fun setAudioRoute(route: String) {
      Log.d(TAG, "setAudioRoute called: $route (manual)")
-     wasManuallySet = true
+     wasManuallySetAudioRoute = true
 
-     val telecomRoute = when (route) {
-         "Speaker" -> CallAudioState.ROUTE_SPEAKER
-         "Earpiece" -> CallAudioState.ROUTE_EARPIECE
-         "Bluetooth" -> CallAudioState.ROUTE_BLUETOOTH
-         "Headset" -> CallAudioState.ROUTE_WIRED_HEADSET
-         else -> {
-             Log.w(TAG, "Unknown audio route: $route")
-             return
-         }
-     }
+     val telecomEndpointType = mapStringToCallEndpointType(route)
 
-     // Set route through active telecom connection
-     currentCallId?.let { callId ->
-         telecomConnections[callId]?.let { connection ->
-             if (connection is MyConnection) {
-                 connection.setTelecomAudioRoute(telecomRoute)
-                 Log.d(TAG, "Set telecom audio route to: $telecomRoute for $route")
-             }
-         }
+     // Find the actual CallEndpoint object from the available list that matches the type
+     val targetEndpoint = availableCallEndpoints.find { it.endpointType == telecomEndpointType }
+         ?: getOrCreateGenericCallEndpoint(telecomEndpointType, route) // Fallback to create generic if not found in available list
+
+     if (targetEndpoint != null) {
+         currentCallId?.let { callId ->
+             telecomConnections[callId]?.let { connection ->
+                 if (connection is MyConnection) {
+                     Log.d(TAG, "Requesting manual telecom audio route to: ${targetEndpoint.endpointName} (type: ${mapCallEndpointTypeToString(targetEndpoint.endpointType)})")
+                     connection.setTelecomAudioRoute(targetEndpoint)
+                 } else {
+                    Log.w(TAG, "Telecom connection for $callId is not MyConnection instance.")
+                 }
+             } ?: Log.w(TAG, "No telecom connection found for $callId to set audio route.")
+         } ?: Log.w(TAG, "No current call ID to set audio route.")
+     } else {
+         Log.w(TAG, "Could not find or create a valid CallEndpoint for manual route: $route (type: $telecomEndpointType)")
      }
  }
 
-  private fun applyAudioRoute(route: String) {
-    val ctx = requireContext()
-    if (audioManager == null) {
-      audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    }
-    val am = audioManager!!
+  // This method is called by MyConnection when its state becomes ACTIVE, or after startCall/startOutgoingCall.
+  fun setInitialCallAudioRoute(callId: String, callType: String) {
+      Log.d(TAG, "Setting initial audio route for callId: $callId, type: $callType")
 
-    // Ensure we're in the correct audio mode
-    if (am.mode != AudioManager.MODE_IN_COMMUNICATION) {
-      am.mode = AudioManager.MODE_IN_COMMUNICATION
-    }
-
-    val previousRoute = currentAudioRoute
-
-    when (route) {
-      "Speaker" -> {
-        am.isSpeakerphoneOn = true
-        if (am.isBluetoothScoOn) {
-          am.stopBluetoothSco()
-          am.isBluetoothScoOn = false
-        }
-        currentAudioRoute = "Speaker"
-        Log.d(TAG, "Audio route set to SPEAKER")
+      if (wasManuallySetAudioRoute) {
+          Log.d(TAG, "Audio route was manually set, skipping initial route setting.")
+          return
       }
-      "Earpiece" -> {
-        am.isSpeakerphoneOn = false
-        if (am.isBluetoothScoOn) {
-          am.stopBluetoothSco()
-          am.isBluetoothScoOn = false
-        }
-        currentAudioRoute = "Earpiece"
-        Log.d(TAG, "Audio route set to EARPIECE")
+
+      val targetEndpointType = when {
+          isBluetoothDeviceConnected() -> CallEndpoint.TYPE_BLUETOOTH
+          isWiredHeadsetConnected() -> CallEndpoint.TYPE_WIRED_HEADSET
+          callType.equals("Video", ignoreCase = true) -> CallEndpoint.TYPE_SPEAKER
+          else -> CallEndpoint.TYPE_EARPIECE
       }
-      "Bluetooth" -> {
-        am.isSpeakerphoneOn = false
-        if (!am.isBluetoothScoOn) {
-          am.startBluetoothSco()
-          am.isBluetoothScoOn = true
-        }
-        currentAudioRoute = "Bluetooth"
-        Log.d(TAG, "Audio route set to BLUETOOTH")
+
+      // We should ideally pick from `availableCallEndpoints`.
+      // If none of that type are explicitly listed (e.g. for default Earpiece/Speaker),
+      // we can try to create a generic one.
+      val targetEndpoint = availableCallEndpoints.find { it.endpointType == targetEndpointType }
+          ?: getOrCreateGenericCallEndpoint(targetEndpointType, mapCallEndpointTypeToString(targetEndpointType))
+
+      if (targetEndpoint != null) {
+          mainHandler.postDelayed({
+              telecomConnections[callId]?.let { connection ->
+                  if (connection is MyConnection) {
+                      Log.d(TAG, "Requesting initial telecom audio route to: ${targetEndpoint.endpointName} (type: ${mapCallEndpointTypeToString(targetEndpoint.endpointType)})")
+                      connection.setTelecomAudioRoute(targetEndpoint)
+                  }
+              } ?: Log.w(TAG, "No telecom connection found for $callId during initial route setting.")
+          }, 500L) // Small delay to allow Telecom to process connection activation
+      } else {
+          Log.w(TAG, "Could not find or create a valid CallEndpoint for initial route type: $targetEndpointType")
       }
-      "Headset" -> {
-        am.isSpeakerphoneOn = false
-        if (am.isBluetoothScoOn) {
-          am.stopBluetoothSco()
-          am.isBluetoothScoOn = false
-        }
-        // For wired headsets, the system automatically routes audio when connected
-        currentAudioRoute = "Headset"
-        Log.d(TAG, "Audio route set to HEADSET")
-      }
-      else -> {
-        Log.w(TAG, "Unknown audio route: $route")
-        return
-      }
-    }
-
-    // Only emit event if route actually changed
-    if (currentAudioRoute != previousRoute) {
-      emitAudioRouteChanged(currentAudioRoute)
-    }
-  }
-
-  private fun getCurrentAudioRoute(): String {
-    val am = audioManager ?: return "Unknown"
-
-    // Check in order of priority: Bluetooth -> Headset -> Speaker -> Earpiece
-    return when {
-      am.isBluetoothScoOn -> "Bluetooth"
-      isWiredHeadsetConnected() -> "Headset"
-      am.isSpeakerphoneOn -> "Speaker"
-      else -> "Earpiece"
-    }
-  }
-
-  private fun isWiredHeadsetConnected(): Boolean {
-    val am = audioManager ?: return false
-
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-      val devices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-      return devices.any { device ->
-        device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
-        device.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
-        device.type == AudioDeviceInfo.TYPE_USB_HEADSET
-      }
-    } else {
-      @Suppress("DEPRECATION")
-      return am.isWiredHeadsetOn
-    }
-  }
-
-  private fun isBluetoothDeviceConnected(): Boolean {
-    val am = audioManager ?: return false
-
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-      val devices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-      return devices.any { device ->
-        device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-        device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-        device.type == AudioDeviceInfo.TYPE_BLE_HEADSET
-      }
-    } else {
-      @Suppress("DEPRECATION")
-      return am.isBluetoothA2dpOn || am.isBluetoothScoOn
-    }
-  }
-
-  private fun setInitialAudioRoute(callType: String) {
-    Log.d(TAG, "Setting initial audio route for call type: $callType")
-
-    // Don't override if user manually set a route
-    if (wasManuallySet) {
-      Log.d(TAG, "Audio route was manually set, skipping initial route")
-      return
-    }
-
-    // Determine default route based on Android standards
-    val defaultRoute = when {
-      isBluetoothDeviceConnected() -> "Bluetooth"
-      isWiredHeadsetConnected() -> "Headset"
-      callType.equals("Video", ignoreCase = true) -> "Speaker"
-      else -> "Earpiece" // Default for audio calls
-    }
-
-    Log.d(TAG, "Setting initial audio route to: $defaultRoute")
-    applyAudioRoute(defaultRoute)
   }
 
   private fun setAudioMode() {
@@ -954,22 +827,85 @@ object CallEngine {
     if (activeCalls.isEmpty()) {
       audioManager?.let { am ->
         am.mode = AudioManager.MODE_NORMAL
-        if (am.isBluetoothScoOn) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am.isBluetoothScoOn) {
           am.stopBluetoothSco()
-          am.isBluetoothScoOn = false
         }
         am.isSpeakerphoneOn = false
       }
-      currentAudioRoute = "Earpiece"
-      wasManuallySet = false
-      unregisterAudioDeviceCallback()
-      Log.d(TAG, "Audio mode reset to MODE_NORMAL")
+      currentActiveCallEndpoint = null // Reset active endpoint
+      availableCallEndpoints = emptyList() // Clear available endpoints
+      wasManuallySetAudioRoute = false
+      Log.d(TAG, "Audio mode reset to MODE_NORMAL, audio endpoints reset.")
     }
   }
 
-  // UPDATED: Fix the method signature
+  private fun mapCallEndpointTypeToString(type: Int): String {
+      return when (type) {
+          CallEndpoint.TYPE_EARPIECE -> "Earpiece"
+          CallEndpoint.TYPE_SPEAKER -> "Speaker"
+          CallEndpoint.TYPE_BLUETOOTH -> "Bluetooth"
+          CallEndpoint.TYPE_WIRED_HEADSET -> "Headset"
+          CallEndpoint.TYPE_STREAMING -> "Streaming"
+          else -> "Unknown"
+      }
+  }
+
+  private fun mapStringToCallEndpointType(typeString: String): Int {
+      return when (typeString) {
+          "Earpiece" -> CallEndpoint.TYPE_EARPIECE
+          "Speaker" -> CallEndpoint.TYPE_SPEAKER
+          "Bluetooth" -> CallEndpoint.TYPE_BLUETOOTH
+          "Headset" -> CallEndpoint.TYPE_WIRED_HEADSET
+          "Streaming" -> CallEndpoint.TYPE_STREAMING
+          else -> CallEndpoint.TYPE_UNKNOWN
+      }
+  }
+
+  private fun getOrCreateGenericCallEndpoint(type: Int, name: String): CallEndpoint? {
+      // This is a fallback to create a CallEndpoint if it's not explicitly in availableCallEndpoints.
+      // Useful for basic types like Earpiece/Speaker that might implicitly exist.
+      return when (type) {
+          CallEndpoint.TYPE_EARPIECE -> CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Earpiece_Default".toByteArray())))
+          CallEndpoint.TYPE_SPEAKER -> CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Speaker_Default".toByteArray())))
+          CallEndpoint.TYPE_BLUETOOTH -> CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Bluetooth_Default".toByteArray())))
+          CallEndpoint.TYPE_WIRED_HEADSET -> CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Headset_Default".toByteArray())))
+          else -> null
+      }
+  }
+
+
+  private fun isWiredHeadsetConnected(): Boolean {
+    val am = audioManager ?: return false
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+      val devices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+      devices.any { device ->
+        device.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+        device.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+        device.type == android.media.AudioDeviceInfo.TYPE_USB_HEADSET
+      }
+    } else {
+        @Suppress("DEPRECATION")
+        am.isWiredHeadsetOn
+    }
+  }
+
+  private fun isBluetoothDeviceConnected(): Boolean {
+    val am = audioManager ?: return false
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+      val devices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+      devices.any { device ->
+        device.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+        device.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+        device.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET
+      }
+    } else {
+        @Suppress("DEPRECATION")
+        am.isBluetoothA2dpOn || am.isBluetoothScoOn
+    }
+  }
+
   private fun emitAudioRouteChanged(currentRoute: String) {
-      val info = getAudioDevices()
+      val info = getAudioDevices() // This now uses CallEngine's internal state
       val deviceStrings = info.devices.map { it.value }
       val payload = JSONObject().apply {
           put("devices", JSONArray(deviceStrings))
@@ -977,95 +913,6 @@ object CallEngine {
       }
       emitEvent(CallEventType.AUDIO_ROUTE_CHANGED, payload)
       Log.d(TAG, "Audio route changed: $currentRoute, available: $deviceStrings")
-  }
-
-  private val audioDeviceCallback = object : AudioDeviceCallback() {
-    override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
-      Log.d(TAG, "Audio devices added")
-      handleAudioDeviceChange(addedDevices, true)
-    }
-
-    override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
-      Log.d(TAG, "Audio devices removed")
-      handleAudioDeviceChange(removedDevices, false)
-    }
-  }
-
-  private fun handleAudioDeviceChange(devices: Array<out AudioDeviceInfo>?, isAdded: Boolean) {
-    if (devices == null || !isCallActive()) return
-
-    val context = requireContext()
-    val currentCallInfo = getCurrentActiveCall()
-    if (currentCallInfo == null) {
-      Log.d(TAG, "No active call, ignoring device change")
-      return
-    }
-
-    val relevantDevices = devices.filter { device ->
-      device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-      device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-      device.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-      device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
-      device.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
-      device.type == AudioDeviceInfo.TYPE_USB_HEADSET
-    }
-
-    if (relevantDevices.isEmpty()) {
-      Log.d(TAG, "No relevant devices in change event")
-      return
-    }
-
-    Log.d(TAG, "Relevant device change detected. Added: $isAdded, wasManuallySet: $wasManuallySet")
-
-    if (isAdded && !wasManuallySet) {
-      // Device connected - switch to it automatically if user hasn't manually set route
-      val deviceType = relevantDevices.first().type
-      val newRoute = when (deviceType) {
-        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
-        AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
-        AudioDeviceInfo.TYPE_BLE_HEADSET -> "Bluetooth"
-        AudioDeviceInfo.TYPE_WIRED_HEADSET,
-        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
-        AudioDeviceInfo.TYPE_USB_HEADSET -> "Headset"
-        else -> null
-      }
-
-      if (newRoute != null && newRoute != currentAudioRoute) {
-        Log.d(TAG, "Auto-switching to newly connected device: $newRoute")
-        // Add slight delay to ensure device is ready
-        mainHandler.postDelayed({
-          applyAudioRoute(newRoute)
-        }, 300)
-      }
-    } else if (!isAdded) {
-      // Device disconnected - fall back to appropriate route
-      val disconnectedType = relevantDevices.first().type
-      val wasCurrentRoute = when (disconnectedType) {
-        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
-        AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
-        AudioDeviceInfo.TYPE_BLE_HEADSET -> currentAudioRoute == "Bluetooth"
-        AudioDeviceInfo.TYPE_WIRED_HEADSET,
-        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
-        AudioDeviceInfo.TYPE_USB_HEADSET -> currentAudioRoute == "Headset"
-        else -> false
-      }
-
-      if (wasCurrentRoute) {
-        Log.d(TAG, "Current audio device disconnected, falling back")
-        // Reset manual flag since the manually selected device is gone
-        wasManuallySet = false
-        mainHandler.postDelayed({
-          setInitialAudioRoute(currentCallInfo.callType)
-        }, 300)
-      }
-    }
-
-    // Always emit devices changed event
-    emitAudioDevicesChanged()
-  }
-
-  private fun getCurrentActiveCall(): CallInfo? {
-    return activeCalls.values.find { it.state == CallState.ACTIVE }
   }
 
   private fun emitAudioDevicesChanged() {
@@ -1079,39 +926,24 @@ object CallEngine {
     Log.d(TAG, "Audio devices changed: available: $deviceStrings")
   }
 
-  fun registerAudioDeviceCallback() {
-    if (isCallActive()) {
-      val context = requireContext()
-      audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-      try {
-        audioManager?.registerAudioDeviceCallback(audioDeviceCallback, null)
-        Log.d(TAG, "Audio device callback registered")
-      } catch (e: Exception) {
-        Log.w(TAG, "Failed to register audio device callback: ${e.message}")
-      }
-    }
-  }
+  // Audio device callbacks are now handled by Telecom and MyConnection.
+  // The CallEngine does not directly register an AudioDeviceCallback.
+  // This part of the code is removed.
 
-  fun unregisterAudioDeviceCallback() {
-    try {
-      audioManager?.unregisterAudioDeviceCallback(audioDeviceCallback)
-      Log.d(TAG, "Audio device callback unregistered")
-    } catch (e: Exception) {
-      Log.w(TAG, "Failed to unregister audio device callback: ${e.message}")
-    }
-  }
-
-  // ====== END AUDIO ROUTING SYSTEM ======
+  // ====== END IMPROVED AUDIO ROUTING SYSTEM ======
 
   fun keepScreenAwake(keepAwake: Boolean) {
     val context = requireContext()
     val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
     if (keepAwake) {
       if (wakeLock == null || wakeLock!!.isHeld.not()) {
+        // Use PARTIAL_WAKE_LOCK to keep CPU awake, SCREEN_DIM_WAKE_LOCK to keep screen on (dim)
+        // For general "keep screen awake", SCREEN_DIM_WAKE_LOCK is appropriate.
         wakeLock = powerManager.newWakeLock(
           PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
           "CallEngine:WakeLock"
         )
+        // Set a timeout for the wakelock to prevent indefinite drain, e.g., 10 minutes
         wakeLock?.acquire(10 * 60 * 1000L)
         Log.d(TAG, "Acquired SCREEN_DIM_WAKE_LOCK")
       }
@@ -1136,10 +968,12 @@ object CallEngine {
   }
 
   private fun validateOutgoingCallRequest(): Boolean {
+    // Only allow outgoing call if no incoming or active call exists and multi-call not allowed
     return !activeCalls.any {
-      it.value.state == CallState.INCOMING || it.value.state == CallState.ACTIVE
+      (!canMakeMultipleCalls && (it.value.state == CallState.INCOMING || it.value.state == CallState.ACTIVE))
     }
   }
+
 
   private fun rejectIncomingCallCollision(callId: String, reason: String) {
     emitEvent(CallEventType.CALL_REJECTED, JSONObject().apply {
@@ -1172,18 +1006,14 @@ object CallEngine {
       channel.setBypassDnd(true)
       channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
 
-      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-        channel.setSound(
-          RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE),
-          AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-            .build()
-        )
-      } else {
-        channel.setSound(null, null)
-        channel.importance = NotificationManager.IMPORTANCE_HIGH
-      }
+      // For Android S (API 31) and above, Telecom manages ringing for self-managed calls
+      // if it's the default dialer or an InCallService with METADATA_IN_CALL_SERVICE_RINGING.
+      // Setting sound to null here allows Telecom to take over or for us to manage manually
+      // if not relying on Telecom for ringing.
+      // Since we play ringtone manually below, ensure channel sound is null to avoid double ringing.
+      channel.setSound(null, null)
+      channel.importance = NotificationManager.IMPORTANCE_HIGH
+
       val manager = context.getSystemService(NotificationManager::class.java)
       manager.createNotificationChannel(channel)
     }
@@ -1196,19 +1026,22 @@ object CallEngine {
     val useCallStyleNotification = supportsCallStyleNotifications()
     Log.d(TAG, "Using CallStyle notification: $useCallStyleNotification")
 
-    if (isDeviceLocked(context) || !useCallStyleNotification) {
-      Log.d(TAG, "Device is locked or CallStyle not supported - using overlay/fallback approach")
+    // Determine if device is locked or if CallStyle is not preferred/supported for current scenario
+    val isDeviceLocked = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+        val keyguardManager = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+        keyguardManager.isKeyguardLocked
+    } else {
+        false // Older APIs, assume no direct lock screen check needed or handled differently
+    }
+
+    if (isDeviceLocked || !useCallStyleNotification) {
+      Log.d(TAG, "Device is locked or CallStyle not supported/preferred - using overlay/fallback approach")
       showCallActivityOverlay(context, callId, callerName, callType, callerPicUrl)
     } else {
       Log.d(TAG, "Device is unlocked and supports CallStyle - using enhanced notification")
       showStandardNotification(context, callId, callerName, callType, callerPicUrl)
     }
     playRingtone()
-  }
-
-  private fun isDeviceLocked(context: Context): Boolean {
-    val keyguardManager = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-    return keyguardManager.isKeyguardLocked
   }
 
   private fun showCallActivityOverlay(context: Context, callId: String, callerName: String, callType: String, callerPicUrl: String?) {
@@ -1232,7 +1065,7 @@ object CallEngine {
         PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
         "CallEngine:LockScreenWake"
       )
-      wakeLock.acquire(5000)
+      wakeLock.acquire(5000) // Acquire for a short duration
       context.startActivity(overlayIntent)
       Log.d(TAG, "Successfully launched CallActivity overlay")
     } catch (e: Exception) {
@@ -1296,6 +1129,7 @@ object CallEngine {
         .setCategory(Notification.CATEGORY_CALL)
         .setPriority(Notification.PRIORITY_MAX)
         .setVisibility(Notification.VISIBILITY_PUBLIC)
+        .setSound(null) // No sound for CallStyle, we manage it separately
         .build()
     } else {
       Notification.Builder(context, NOTIF_CHANNEL_ID)
@@ -1310,6 +1144,7 @@ object CallEngine {
         .setOngoing(true)
         .setAutoCancel(false)
         .setVisibility(Notification.VISIBILITY_PUBLIC)
+        .setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)) // Fallback for older styles
         .build()
     }
 
@@ -1363,26 +1198,28 @@ object CallEngine {
     val activityManager =
       context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
 
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+    // For API 23+, getRunningTasks is deprecated. Use UsageStatsManager or check AppTasks
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) { // LMR1 is API 22, getAppTasks available from API 21, but getRunningTasks deprecated from API 23.
       try {
         val tasks = activityManager.appTasks
         if (tasks.isNotEmpty()) {
-          val taskInfo = tasks[0].taskInfo
-          return taskInfo.topActivity?.className?.contains("MainActivity") == true
+          // get(0) is the top-most task
+          val topActivityComponentName = tasks[0].taskInfo.topActivity
+          return topActivityComponentName?.className?.contains("MainActivity") == true
         }
       } catch (e: Exception) {
-        Log.w(TAG, "Failed to get app tasks: ${e.message}")
+        Log.w(TAG, "Failed to get app tasks for foreground check: ${e.message}")
       }
     } else {
+      @Suppress("DEPRECATION")
       try {
-        @Suppress("DEPRECATION")
         val tasks = activityManager.getRunningTasks(1)
         if (tasks.isNotEmpty()) {
           val runningTaskInfo = tasks[0]
           return runningTaskInfo.topActivity?.className?.contains("MainActivity") == true
         }
       } catch (e: Exception) {
-        Log.w(TAG, "Failed to get running tasks: ${e.message}")
+        Log.w(TAG, "Failed to get running tasks for foreground check (deprecated): ${e.message}")
       }
     }
     return false
@@ -1497,6 +1334,7 @@ object CallEngine {
         isLooping = true
         start()
       }
+      Log.d(TAG, "Ringback tone started playing")
     } catch (e: Exception) {
       Log.e(TAG, "Failed to play ringback tone: ${e.message}")
     }
@@ -1538,5 +1376,9 @@ object CallEngine {
     cachedEvents.clear()
     isInitialized.set(false)
     appContext = null
+    // Reset audio states
+    currentActiveCallEndpoint = null
+    availableCallEndpoints = emptyList()
+    wasManuallySetAudioRoute = false
   }
 }

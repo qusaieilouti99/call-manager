@@ -1,12 +1,13 @@
 package com.margelo.nitro.qusaieilouti99.callmanager
 
+import android.os.Bundle
+import android.telecom.CallAudioState
 import android.telecom.Connection
 import android.telecom.ConnectionRequest
 import android.telecom.ConnectionService
 import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
 import android.telecom.VideoProfile
-import android.telecom.CallAudioState
 import android.util.Log
 import java.util.UUID
 
@@ -32,16 +33,17 @@ class MyConnectionService : ConnectionService() {
         val displayName = request.extras?.getString(EXTRA_DISPLAY_NAME) ?: "Unknown"
         val pictureUrl = request.extras?.getString(EXTRA_PICTURE_URL)
         val isVideoCallBoolean = request.extras?.getBoolean(EXTRA_IS_VIDEO_CALL_BOOLEAN, false) ?: false
+        val requestedVideoState = request.extras?.getInt(TelecomManager.EXTRA_INCOMING_VIDEO_STATE, VideoProfile.STATE_AUDIO_ONLY) ?: VideoProfile.STATE_AUDIO_ONLY
 
-        Log.d(TAG, "Creating incoming connection: callId=$callId, type=$callType, name=$displayName")
+        Log.d(TAG, "Creating incoming connection: callId=$callId, type=$callType, name=$displayName, requestedVideoState=$requestedVideoState")
 
         val connection = MyConnection(applicationContext, callId, callType, displayName, pictureUrl)
 
-        val videoState = if (isVideoCallBoolean) VideoProfile.STATE_BIDIRECTIONAL else VideoProfile.STATE_AUDIO_ONLY
-        connection.setVideoState(videoState)
+        // Set the video state based on what was requested in addNewIncomingCall.
+        connection.setVideoState(requestedVideoState)
         connection.setRinging()
 
-        Log.d(TAG, "Created incoming connection for callId: $callId. Status: RINGING, VideoState: $videoState")
+        Log.d(TAG, "Created incoming connection for callId: $callId. Status: RINGING, VideoState: ${connection.getVideoState()}")
         return connection
     }
 
@@ -56,21 +58,22 @@ class MyConnectionService : ConnectionService() {
         val displayName = request.extras?.getString(EXTRA_DISPLAY_NAME) ?: "Unknown"
         val pictureUrl = request.extras?.getString(EXTRA_PICTURE_URL)
         val isVideoCallBoolean = request.extras?.getBoolean(EXTRA_IS_VIDEO_CALL_BOOLEAN, false) ?: false
+        val requestedVideoState = request.extras?.getInt(TelecomManager.EXTRA_START_CALL_WITH_VIDEO_STATE, VideoProfile.STATE_AUDIO_ONLY) ?: VideoProfile.STATE_AUDIO_ONLY
 
-        Log.d(TAG, "Creating outgoing connection: callId=$callId, type=$callType, name=$displayName")
+        Log.d(TAG, "Creating outgoing connection: callId=$callId, type=$callType, name=$displayName, requestedVideoState=$requestedVideoState")
 
         val connection = MyConnection(applicationContext, callId, callType, displayName, pictureUrl)
 
-        val videoState = if (isVideoCallBoolean) VideoProfile.STATE_BIDIRECTIONAL else VideoProfile.STATE_AUDIO_ONLY
-        connection.setVideoState(videoState)
+        // Set the video state based on what was requested in placeCall.
+        connection.setVideoState(requestedVideoState)
         connection.setDialing()
 
-        Log.d(TAG, "Created outgoing connection for callId: $callId. Status: DIALING, VideoState: $videoState")
+        Log.d(TAG, "Created outgoing connection for callId: $callId. Status: DIALING, VideoState: ${connection.getVideoState()}")
 
-        if (request.extras?.getBoolean(TelecomManager.EXTRA_START_CALL_WITH_SPEAKERPHONE, false) == true) {
-            Log.d(TAG, "Hinting Telecom to start outgoing call with speakerphone as per request extras.")
-            connection.setAudioRoute(CallAudioState.ROUTE_SPEAKER)
-        }
+        // TelecomManager.EXTRA_START_CALL_WITH_SPEAKERPHONE is a hint to Telecom.
+        // The actual audio route will be set by CallEngine.setInitialCallAudioRoute when the call
+        // becomes active (or immediately for startCall scenario).
+        // No direct `connection.setAudioRoute()` here as it's deprecated and handled by CallEndpoint flow.
 
         return connection
     }
