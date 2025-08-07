@@ -124,10 +124,19 @@ class CallManager : HybridCallManagerSpec() {
         )
     }
 
-    // --- New Hybrid Method for SYSTEM_ALERT_WINDOW permission ---
-    override fun requestOverlayPermissionAndroid(): Boolean {
-        Log.d(TAG, "requestOverlayPermissionAndroid requested")
+    // --- New Hybrid Method for SYSTEM_ALERT_WINDOW permission CHECK ---
+    override fun hasOverlayPermissionAndroid(): Boolean {
+        Log.d(TAG, "hasOverlayPermissionAndroid requested (check only)")
         ensureInitialized()
-        return CallEngine.requestOverlayPermission()
+        val context = requireNotNull(CallEngine.getContext()) { "CallEngine must be initialized with context" }
+        return CallEngine.checkOverlayPermissionGranted(context)
+    }
+
+    // --- Repurposed Hybrid Method for SYSTEM_ALERT_WINDOW permission LAUNCH ---
+    override fun requestOverlayPermissionAndroid(): Boolean {
+        Log.d(TAG, "requestOverlayPermissionAndroid requested (launch settings)")
+        ensureInitialized()
+        val context = requireNotNull(CallEngine.getContext()) { "CallEngine must be initialized with context" }
+        return CallEngine.launchOverlayPermissionSettings(context)
     }
 }

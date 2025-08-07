@@ -1,5 +1,6 @@
 package com.margelo.nitro.qusaieilouti99.callmanager
 
+import android.app.Activity
 import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
@@ -1043,17 +1044,14 @@ object CallEngine {
       putExtra("LOCK_SCREEN_MODE", true)
     }
 
-    try {
-      // For SYSTEM_ALERT_WINDOW usage, the permission must be granted.
-      // We are checking it in requestOverlayPermission.
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(context)) {
-          Log.w(TAG, "Cannot show CallActivity overlay without SYSTEM_ALERT_WINDOW permission. Launching permission request.")
-          // Instead of starting the activity which will fail, launch the permission request.
-          requestOverlayPermission()
-          showStandardNotification(context, callId, callerName, callType, callerPicUrl)
-          return
-      }
+    // ONLY CHECK permission, DO NOT REQUEST HERE
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !checkOverlayPermissionGranted(context)) {
+        Log.w(TAG, "Cannot show CallActivity overlay without SYSTEM_ALERT_WINDOW permission. Falling back to standard notification.")
+        showStandardNotification(context, callId, callerName, callType, callerPicUrl)
+        return
+    }
 
+    try {
       val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
       val wakeLock = powerManager.newWakeLock(
         PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
@@ -1063,7 +1061,7 @@ object CallEngine {
       context.startActivity(overlayIntent)
       Log.d(TAG, "Successfully launched CallActivity overlay")
     } catch (e: Exception) {
-      Log.e(TAG, "Overlay failed, falling back to standard notification: ${e.message}")
+      Log.e(TAG, "Overlay failed (after permission check), falling back to standard notification: ${e.message}")
       showStandardNotification(context, callId, callerName, callType, callerPicUrl)
     }
   }
@@ -1374,34 +1372,50 @@ object CallEngine {
     wasManuallySetAudioRoute = false
   }
 
-  // --- New Function for SYSTEM_ALERT_WINDOW permission ---
-  fun requestOverlayPermission(): Boolean {
-    val context = requireContext()
+  // --- Refactored SYSTEM_ALERT_WINDOW permission functions ---
+
+  /**
+   * Checks if the SYSTEM_ALERT_WINDOW permission (Draw Over Other Apps) is granted.
+   * This function only checks; it does not launch any UI for permission request.
+   * @param context The application context.
+   * @return True if the permission is granted or not required (API < 23), false otherwise.
+   */
+  fun checkOverlayPermissionGranted(context: Context): Boolean {
     return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-      if (!Settings.canDrawOverlays(context)) {
-        Log.d(TAG, "SYSTEM_ALERT_WINDOW permission not granted. Requesting it.")
-        try {
-          val intent = Intent(
-            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-            Uri.parse("package:" + context.packageName)
-          ).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) // Required when starting from non-Activity context
-          }
-          context.startActivity(intent)
-          Log.d(TAG, "Launched SYSTEM_ALERT_WINDOW permission settings.")
-          false // Not granted yet, user needs to act
-        } catch (e: Exception) {
-          Log.e(TAG, "Failed to launch SYSTEM_ALERT_WINDOW permission settings: ${e.message}", e)
-          false // Failed to launch, so not granted
-        }
-      } else {
-        Log.d(TAG, "SYSTEM_ALERT_WINDOW permission already granted.")
-        true
-      }
+      Settings.canDrawOverlays(context)
     } else {
-      // Permissions granted at install time for older Android versions
-      Log.d(TAG, "SYSTEM_ALERT_WINDOW permission automatically granted on API < 23.")
-      true
+      true // Permissions granted at install time for older Android versions
+    }
+  }
+
+  /**
+   * Launches the system settings screen where the user can grant the SYSTEM_ALERT_WINDOW permission.
+   * This function should be called after your app has explained to the user why the permission is needed.
+   * @param context The context to start the activity. Ideally, an Activity context is used,
+   *                but if an Application context is used, FLAG_ACTIVITY_NEW_TASK will be added.
+   * @return True if the settings activity was successfully launched, false otherwise.
+   */
+  fun launchOverlayPermissionSettings(context: Context): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+      Log.d(TAG, "SYSTEM_ALERT_WINDOW permission automatically granted on API < 23. No settings to launch.")
+      return true
+    }
+
+    Log.d(TAG, "Launching SYSTEM_ALERT_WINDOW permission settings.")
+    try {
+      val intent = Intent(
+        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+        Uri.parse("package:" + context.packageName)
+      )
+      if (context !is Activity) {
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        Log.d(TAG, "Added FLAG_ACTIVITY_NEW_TASK as context is not an Activity.")
+      }
+      context.startActivity(intent)
+      return true // Successfully launched settings
+    } catch (e: Exception) {
+      Log.e(TAG, "Failed to launch SYSTEM_ALERT_WINDOW permission settings: ${e.message}", e)
+      return false // Failed to launch
     }
   }
 }

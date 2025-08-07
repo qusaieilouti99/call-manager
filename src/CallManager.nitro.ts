@@ -64,6 +64,7 @@ export interface CallManager
   hasActiveCall(): boolean; // if there is an active call, no matter ringing, incoming, outgoing, whatever
 
   requestOverlayPermissionAndroid(): boolean; // only android
+  hasOverlayPermissionAndroid(): boolean; // only android
 }
 
 export const CallManagerHybridObject =

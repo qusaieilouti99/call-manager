@@ -158,4 +158,9 @@ public class CallManager: HybridCallManagerSpec {
     logger.info("🎯 requestOverlayPermissionAndroid ▶ js → native")
     return true
   }
+
+  public func hasOverlayPermissionAndroid() throws -> Bool {
+    logger.info("🎯 hasOverlayPermissionAndroid ▶ js → native")
+    return true
+  }
 }
