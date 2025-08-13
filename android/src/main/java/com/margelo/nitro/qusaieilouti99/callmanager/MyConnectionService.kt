@@ -1,7 +1,6 @@
 package com.margelo.nitro.qusaieilouti99.callmanager
 
 import android.os.Bundle
-import android.telecom.CallAudioState
 import android.telecom.Connection
 import android.telecom.ConnectionRequest
 import android.telecom.ConnectionService
@@ -43,7 +42,7 @@ class MyConnectionService : ConnectionService() {
         connection.setVideoState(requestedVideoState)
         connection.setRinging()
 
-        Log.d(TAG, "Created incoming connection for callId: $callId. Status: RINGING, VideoState: ${connection.getVideoState()}")
+        Log.d(TAG, "Created incoming connection for callId: $callId. Status: RINGING, VideoState: ${requestedVideoState}")
         return connection
     }
 
@@ -68,7 +67,7 @@ class MyConnectionService : ConnectionService() {
         connection.setVideoState(requestedVideoState)
         connection.setDialing()
 
-        Log.d(TAG, "Created outgoing connection for callId: $callId. Status: DIALING, VideoState: ${connection.getVideoState()}")
+        Log.d(TAG, "Created outgoing connection for callId: $callId. Status: DIALING, VideoState: ${requestedVideoState}")
 
         // TelecomManager.EXTRA_START_CALL_WITH_SPEAKERPHONE is a hint to Telecom.
         // The actual audio route will be set by CallEngine.setInitialCallAudioRoute when the call

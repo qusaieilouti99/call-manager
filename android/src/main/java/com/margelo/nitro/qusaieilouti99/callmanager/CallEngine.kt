@@ -24,7 +24,6 @@ import android.os.ParcelUuid
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.telecom.CallAudioState
-import android.telecom.CallEndpoint
 import android.telecom.Connection
 import android.telecom.DisconnectCause
 import android.telecom.PhoneAccount
@@ -45,8 +44,8 @@ import android.provider.Settings // Import for Settings.canDrawOverlays and ACTI
  * Core call‐management engine. Manages self-managed telecom calls,
  * audio routing, UI notifications, etc.
  *
- * Audio routing now primarily leverages Android Telecom's CallEndpoint API (API 34+),
- * allowing the system to manage the underlying audio device changes.
+ * Audio routing now uses both modern CallEndpoint API (API 34+) and legacy AudioManager (API 28-33)
+ * for backward compatibility.
  */
 object CallEngine {
   private const val TAG = "CallEngine"
@@ -91,9 +90,15 @@ object CallEngine {
   private var eventHandler: ((CallEventType, String) -> Unit)? = null
   private val cachedEvents = mutableListOf<Pair<CallEventType, String>>()
 
-  // Audio routing state for CallEndpoint API (API 34+)
-  private var currentActiveCallEndpoint: CallEndpoint? = null
-  private var availableCallEndpoints: List<CallEndpoint> = emptyList()
+  // Audio routing state for both modern and legacy systems
+  // Modern (API 34+)
+  private var currentActiveCallEndpoint: Any? = null // Using Any to avoid API level issues
+  private var availableCallEndpoints: List<Any> = emptyList()
+
+  // Legacy (API 28-33)
+  private var legacyCurrentAudioRoute: String = "Earpiece"
+  private var legacyAvailableAudioDevices: Set<String> = setOf("Earpiece", "Speaker")
+
   private var wasManuallySetAudioRoute: Boolean = false
   private var callStartTime: Long = 0
 
@@ -507,7 +512,7 @@ object CallEngine {
 
     setAudioMode()
 
-    // Set initial audio route using Telecom's CallEndpoint API
+    // Set initial audio route using appropriate API
     setInitialCallAudioRoute(callId, callInfo.callType)
 
     if (isLocalAnswer) {
@@ -740,87 +745,187 @@ object CallEngine {
     })
   }
 
-  // ====== IMPROVED AUDIO ROUTING SYSTEM (using CallEndpoint API) ======
+  // ====== IMPROVED AUDIO ROUTING SYSTEM (supports both modern and legacy) ======
 
-  fun onTelecomAvailableEndpointsChanged(endpoints: List<CallEndpoint>) {
+  // Modern CallEndpoint API methods (API 34+)
+  @Suppress("NewApi")
+  fun onTelecomAvailableEndpointsChanged(endpoints: List<android.telecom.CallEndpoint>) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
       availableCallEndpoints = endpoints
       Log.d(TAG, "Available CallEndpoints updated: ${endpoints.map { "${it.endpointName}(${mapCallEndpointTypeToString(it.endpointType)})" }}")
       emitAudioDevicesChanged()
+    }
   }
 
-  fun onTelecomAudioRouteChanged(callId: String, callEndpoint: CallEndpoint) {
+  @Suppress("NewApi")
+  fun onTelecomAudioRouteChanged(callId: String, callEndpoint: android.telecom.CallEndpoint) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
       Log.d(TAG, "Telecom audio route changed for $callId: endpoint=${callEndpoint.endpointName} (type=${mapCallEndpointTypeToString(callEndpoint.endpointType)})")
       currentActiveCallEndpoint = callEndpoint
       emitAudioRouteChanged(mapCallEndpointTypeToString(callEndpoint.endpointType))
+    }
   }
 
   fun getAudioDevices(): AudioRoutesInfo {
-    val devices = availableCallEndpoints.map { StringHolder(mapCallEndpointTypeToString(it.endpointType)) }.toMutableSet()
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+      getModernAudioDevices()
+    } else {
+      getLegacyAudioDevices()
+    }
+  }
+
+  @Suppress("NewApi")
+  private fun getModernAudioDevices(): AudioRoutesInfo {
+    val endpoints = availableCallEndpoints as? List<android.telecom.CallEndpoint> ?: emptyList()
+    val devices = endpoints.map { StringHolder(mapCallEndpointTypeToString(it.endpointType)) }.toMutableSet()
 
     if (!devices.any { it.value == "Earpiece" }) devices.add(StringHolder("Earpiece"))
     if (!devices.any { it.value == "Speaker" }) devices.add(StringHolder("Speaker"))
 
-    val current = currentActiveCallEndpoint?.let { mapCallEndpointTypeToString(it.endpointType) } ?: "Unknown"
-    Log.d(TAG, "Available audio devices: ${devices.toList()}, current: $current")
+    val currentEndpoint = currentActiveCallEndpoint as? android.telecom.CallEndpoint
+    val current = currentEndpoint?.let { mapCallEndpointTypeToString(it.endpointType) } ?: "Unknown"
 
+    Log.d(TAG, "Modern audio devices: ${devices.map { it.value }}, current: $current")
     return AudioRoutesInfo(devices.toTypedArray(), current)
   }
 
+  private fun getLegacyAudioDevices(): AudioRoutesInfo {
+    updateLegacyAvailableAudioDevices()
+    val devices = legacyAvailableAudioDevices.map { StringHolder(it) }.toSet()
+    Log.d(TAG, "Legacy audio devices: ${devices.map { it.value }}, current: $legacyCurrentAudioRoute")
+    return AudioRoutesInfo(devices.toTypedArray(), legacyCurrentAudioRoute)
+  }
+
   fun setAudioRoute(route: String) {
-     Log.d(TAG, "setAudioRoute called: $route (manual)")
-     wasManuallySetAudioRoute = true
+    Log.d(TAG, "setAudioRoute called: $route (manual)")
+    wasManuallySetAudioRoute = true
 
-     val telecomEndpointType = mapStringToCallEndpointType(route)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+      setModernAudioRoute(route)
+    } else {
+      setLegacyAudioRouteDirect(route)
+    }
+  }
 
-     val targetEndpoint = availableCallEndpoints.find { it.endpointType == telecomEndpointType }
-         ?: getOrCreateGenericCallEndpoint(telecomEndpointType, route)
+  @Suppress("NewApi")
+  private fun setModernAudioRoute(route: String) {
+    val telecomEndpointType = mapStringToCallEndpointType(route)
+    val endpoints = availableCallEndpoints as? List<android.telecom.CallEndpoint> ?: emptyList()
 
-     if (targetEndpoint != null) {
-         currentCallId?.let { callId ->
-             telecomConnections[callId]?.let { connection ->
-                 if (connection is MyConnection) {
-                     Log.d(TAG, "Requesting manual telecom audio route to: ${targetEndpoint.endpointName} (type: ${mapCallEndpointTypeToString(targetEndpoint.endpointType)})")
-                     connection.setTelecomAudioRoute(targetEndpoint)
-                 } else {
-                    Log.w(TAG, "Telecom connection for $callId is not MyConnection instance.")
-                 }
-             } ?: Log.w(TAG, "No telecom connection found for $callId to set audio route.")
-         } ?: Log.w(TAG, "No current call ID to set audio route.")
-     } else {
-         Log.w(TAG, "Could not find or create a valid CallEndpoint for manual route: $route (type: $telecomEndpointType)")
-     }
- }
+    val targetEndpoint = endpoints.find { it.endpointType == telecomEndpointType }
+        ?: getOrCreateGenericCallEndpoint(telecomEndpointType, route)
+
+    if (targetEndpoint != null) {
+      currentCallId?.let { callId ->
+        telecomConnections[callId]?.let { connection ->
+          if (connection is MyConnection) {
+            Log.d(TAG, "Requesting modern telecom audio route to: ${targetEndpoint.endpointName} (type: ${mapCallEndpointTypeToString(targetEndpoint.endpointType)})")
+            connection.setTelecomAudioRoute(targetEndpoint)
+          } else {
+            Log.w(TAG, "Telecom connection for $callId is not MyConnection instance.")
+          }
+        } ?: Log.w(TAG, "No telecom connection found for $callId to set audio route.")
+      } ?: Log.w(TAG, "No current call ID to set audio route.")
+    } else {
+      Log.w(TAG, "Could not find or create a valid CallEndpoint for modern route: $route (type: $telecomEndpointType)")
+    }
+  }
+
+  fun setLegacyAudioRouteDirect(route: String) {
+    Log.d(TAG, "Setting legacy audio route: $route")
+
+    val am = audioManager ?: return
+
+    try {
+      when (route) {
+        "Speaker" -> {
+          am.isSpeakerphoneOn = true
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am.isBluetoothScoOn) {
+            am.stopBluetoothSco()
+          }
+          legacyCurrentAudioRoute = "Speaker"
+        }
+        "Earpiece" -> {
+          am.isSpeakerphoneOn = false
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am.isBluetoothScoOn) {
+            am.stopBluetoothSco()
+          }
+          legacyCurrentAudioRoute = "Earpiece"
+        }
+        "Bluetooth" -> {
+          am.isSpeakerphoneOn = false
+          if (isBluetoothDeviceConnected()) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+              am.startBluetoothSco()
+            }
+            legacyCurrentAudioRoute = "Bluetooth"
+          } else {
+            Log.w(TAG, "No Bluetooth device connected, falling back to Earpiece")
+            am.isSpeakerphoneOn = false
+            legacyCurrentAudioRoute = "Earpiece"
+          }
+        }
+        "Headset" -> {
+          am.isSpeakerphoneOn = false
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am.isBluetoothScoOn) {
+            am.stopBluetoothSco()
+          }
+          if (isWiredHeadsetConnected()) {
+            legacyCurrentAudioRoute = "Headset"
+          } else {
+            Log.w(TAG, "No wired headset connected, falling back to Earpiece")
+            legacyCurrentAudioRoute = "Earpiece"
+          }
+        }
+        else -> {
+          Log.w(TAG, "Unknown legacy audio route: $route, falling back to Earpiece")
+          am.isSpeakerphoneOn = false
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am.isBluetoothScoOn) {
+            am.stopBluetoothSco()
+          }
+          legacyCurrentAudioRoute = "Earpiece"
+        }
+      }
+
+      Log.d(TAG, "Legacy audio route set to: $legacyCurrentAudioRoute")
+      emitAudioRouteChanged(legacyCurrentAudioRoute)
+
+    } catch (e: Exception) {
+      Log.e(TAG, "Error setting legacy audio route: ${e.message}", e)
+    }
+  }
+
+  // Legacy method for MyConnection fallback
+  fun setLegacyAudioRoute(endpoint: Any) {
+    if (endpoint is String) {
+      setLegacyAudioRouteDirect(endpoint)
+    } else {
+      Log.w(TAG, "Invalid endpoint type for legacy audio routing")
+    }
+  }
 
   fun setInitialCallAudioRoute(callId: String, callType: String) {
-      Log.d(TAG, "Setting initial audio route for callId: $callId, type: $callType")
+    Log.d(TAG, "Setting initial audio route for callId: $callId, type: $callType")
 
-      if (wasManuallySetAudioRoute) {
-          Log.d(TAG, "Audio route was manually set, skipping initial route setting.")
-          return
-      }
+    if (wasManuallySetAudioRoute) {
+      Log.d(TAG, "Audio route was manually set, skipping initial route setting.")
+      return
+    }
 
-      val targetEndpointType = when {
-          isBluetoothDeviceConnected() -> CallEndpoint.TYPE_BLUETOOTH
-          isWiredHeadsetConnected() -> CallEndpoint.TYPE_WIRED_HEADSET
-          callType.equals("Video", ignoreCase = true) -> CallEndpoint.TYPE_SPEAKER
-          else -> CallEndpoint.TYPE_EARPIECE
-      }
+    val targetRoute = when {
+      isBluetoothDeviceConnected() -> "Bluetooth"
+      isWiredHeadsetConnected() -> "Headset"
+      callType.equals("Video", ignoreCase = true) -> "Speaker"
+      else -> "Earpiece"
+    }
 
-      val targetEndpoint = availableCallEndpoints.find { it.endpointType == targetEndpointType }
-          ?: getOrCreateGenericCallEndpoint(targetEndpointType, mapCallEndpointTypeToString(targetEndpointType))
-
-      if (targetEndpoint != null) {
-          mainHandler.postDelayed({
-              telecomConnections[callId]?.let { connection ->
-                  if (connection is MyConnection) {
-                      Log.d(TAG, "Requesting initial telecom audio route to: ${targetEndpoint.endpointName} (type: ${mapCallEndpointTypeToString(targetEndpoint.endpointType)})")
-                      connection.setTelecomAudioRoute(targetEndpoint)
-                  }
-              } ?: Log.w(TAG, "No telecom connection found for $callId during initial route setting.")
-          }, 500L)
+    mainHandler.postDelayed({
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        setModernAudioRoute(targetRoute)
       } else {
-          Log.w(TAG, "Could not find or create a valid CallEndpoint for initial route type: $targetEndpointType")
+        setLegacyAudioRouteDirect(targetRoute)
       }
+    }, 500L)
   }
 
   private fun setAudioMode() {
@@ -837,43 +942,83 @@ object CallEngine {
         }
         am.isSpeakerphoneOn = false
       }
+
+      // Reset both modern and legacy state
       currentActiveCallEndpoint = null
       availableCallEndpoints = emptyList()
+      legacyCurrentAudioRoute = "Earpiece"
+      legacyAvailableAudioDevices = setOf("Earpiece", "Speaker")
       wasManuallySetAudioRoute = false
+
       Log.d(TAG, "Audio mode reset to MODE_NORMAL, audio endpoints reset.")
     }
   }
 
+  @Suppress("NewApi")
   private fun mapCallEndpointTypeToString(type: Int): String {
-      return when (type) {
-          CallEndpoint.TYPE_EARPIECE -> "Earpiece"
-          CallEndpoint.TYPE_SPEAKER -> "Speaker"
-          CallEndpoint.TYPE_BLUETOOTH -> "Bluetooth"
-          CallEndpoint.TYPE_WIRED_HEADSET -> "Headset"
-          CallEndpoint.TYPE_STREAMING -> "Streaming"
-          else -> "Unknown"
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+      when (type) {
+        android.telecom.CallEndpoint.TYPE_EARPIECE -> "Earpiece"
+        android.telecom.CallEndpoint.TYPE_SPEAKER -> "Speaker"
+        android.telecom.CallEndpoint.TYPE_BLUETOOTH -> "Bluetooth"
+        android.telecom.CallEndpoint.TYPE_WIRED_HEADSET -> "Headset"
+        android.telecom.CallEndpoint.TYPE_STREAMING -> "Streaming"
+        else -> "Unknown"
       }
+    } else {
+      "Unknown"
+    }
   }
 
+  @Suppress("NewApi")
   private fun mapStringToCallEndpointType(typeString: String): Int {
-      return when (typeString) {
-          "Earpiece" -> CallEndpoint.TYPE_EARPIECE
-          "Speaker" -> CallEndpoint.TYPE_SPEAKER
-          "Bluetooth" -> CallEndpoint.TYPE_BLUETOOTH
-          "Headset" -> CallEndpoint.TYPE_WIRED_HEADSET
-          "Streaming" -> CallEndpoint.TYPE_STREAMING
-          else -> CallEndpoint.TYPE_UNKNOWN
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+      when (typeString) {
+        "Earpiece" -> android.telecom.CallEndpoint.TYPE_EARPIECE
+        "Speaker" -> android.telecom.CallEndpoint.TYPE_SPEAKER
+        "Bluetooth" -> android.telecom.CallEndpoint.TYPE_BLUETOOTH
+        "Headset" -> android.telecom.CallEndpoint.TYPE_WIRED_HEADSET
+        "Streaming" -> android.telecom.CallEndpoint.TYPE_STREAMING
+        else -> android.telecom.CallEndpoint.TYPE_UNKNOWN
       }
+    } else {
+      0 // Fallback value
+    }
   }
 
-  private fun getOrCreateGenericCallEndpoint(type: Int, name: String): CallEndpoint? {
-      return when (type) {
-          CallEndpoint.TYPE_EARPIECE -> CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Earpiece_Default".toByteArray())))
-          CallEndpoint.TYPE_SPEAKER -> CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Speaker_Default".toByteArray())))
-          CallEndpoint.TYPE_BLUETOOTH -> CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Bluetooth_Default".toByteArray())))
-          CallEndpoint.TYPE_WIRED_HEADSET -> CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Headset_Default".toByteArray())))
-          else -> null
+  @Suppress("NewApi")
+  private fun getOrCreateGenericCallEndpoint(type: Int, name: String): android.telecom.CallEndpoint? {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+      when (type) {
+        android.telecom.CallEndpoint.TYPE_EARPIECE -> android.telecom.CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Earpiece_Default".toByteArray())))
+        android.telecom.CallEndpoint.TYPE_SPEAKER -> android.telecom.CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Speaker_Default".toByteArray())))
+        android.telecom.CallEndpoint.TYPE_BLUETOOTH -> android.telecom.CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Bluetooth_Default".toByteArray())))
+        android.telecom.CallEndpoint.TYPE_WIRED_HEADSET -> android.telecom.CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Headset_Default".toByteArray())))
+        else -> null
       }
+    } else {
+      null
+    }
+  }
+
+  private fun updateLegacyAvailableAudioDevices() {
+    val devices = mutableSetOf<String>()
+
+    // Always available
+    devices.add("Earpiece")
+    devices.add("Speaker")
+
+    // Check for Bluetooth
+    if (isBluetoothDeviceConnected()) {
+      devices.add("Bluetooth")
+    }
+
+    // Check for wired headset
+    if (isWiredHeadsetConnected()) {
+      devices.add("Headset")
+    }
+
+    legacyAvailableAudioDevices = devices
   }
 
   private fun isWiredHeadsetConnected(): Boolean {
@@ -898,7 +1043,7 @@ object CallEngine {
       devices.any { device ->
         device.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
         device.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-        device.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET
+        (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && device.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET)
       }
     } else {
         @Suppress("DEPRECATION")
@@ -907,14 +1052,14 @@ object CallEngine {
   }
 
   private fun emitAudioRouteChanged(currentRoute: String) {
-      val info = getAudioDevices()
-      val deviceStrings = info.devices.map { it.value }
-      val payload = JSONObject().apply {
-          put("devices", JSONArray(deviceStrings))
-          put("currentRoute", currentRoute)
-      }
-      emitEvent(CallEventType.AUDIO_ROUTE_CHANGED, payload)
-      Log.d(TAG, "Audio route changed: $currentRoute, available: $deviceStrings")
+    val info = getAudioDevices()
+    val deviceStrings = info.devices.map { it.value }
+    val payload = JSONObject().apply {
+      put("devices", JSONArray(deviceStrings))
+      put("currentRoute", currentRoute)
+    }
+    emitEvent(CallEventType.AUDIO_ROUTE_CHANGED, payload)
+    Log.d(TAG, "Audio route changed: $currentRoute, available: $deviceStrings")
   }
 
   private fun emitAudioDevicesChanged() {

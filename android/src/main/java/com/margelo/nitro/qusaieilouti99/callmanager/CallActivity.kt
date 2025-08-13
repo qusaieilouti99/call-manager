@@ -1,4 +1,3 @@
-// File: CallActivity.kt
 package com.margelo.nitro.qusaieilouti99.callmanager
 
 import android.app.Activity
@@ -7,8 +6,6 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
-import android.graphics.RenderEffect
-import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
@@ -81,13 +78,16 @@ class CallActivity : Activity(), CallEngine.CallEndListener {
         ViewGroup.LayoutParams.MATCH_PARENT
       )
       scaleType = ImageView.ScaleType.CENTER_CROP
+
+      // Apply blur effect only on API 31+ (Android S)
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         setRenderEffect(
-          RenderEffect.createBlurEffect(
-            50f, 50f, Shader.TileMode.CLAMP
+          android.graphics.RenderEffect.createBlurEffect(
+            50f, 50f, android.graphics.Shader.TileMode.CLAMP
           )
         )
       }
+      // For older versions, the blur will be handled in loadAndBlurBackground
     }
     root.addView(bg)
     loadAndBlurBackground(bg, avatarUrl)
@@ -261,13 +261,14 @@ class CallActivity : Activity(), CallEngine.CallEndListener {
       bmp ?: return@Thread
 
       val finalBmp = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-        // heavier blur via 16× down/up-scale
+        // For API 28-30, apply software blur since RenderEffect is not available
         val factor = 16
         val w = bmp.width / factor
         val h = bmp.height / factor
         val small = Bitmap.createScaledBitmap(bmp, w, h, true)
         Bitmap.createScaledBitmap(small, bmp.width, bmp.height, true)
       } else {
+        // For API 31+, RenderEffect handles blur
         bmp
       }
 
@@ -352,16 +353,18 @@ class CallActivity : Activity(), CallEngine.CallEndListener {
         WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
         WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
       )
-      (getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager)
-        .requestDismissKeyguard(this,
-          object : KeyguardManager.KeyguardDismissCallback() {
-            override fun onDismissSucceeded() {
-              Log.d(TAG, "Samsung keyguard dismissed")
-            }
-            override fun onDismissError() {
-              Log.w(TAG, "Keyguard dismiss error")
-            }
-          })
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        (getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager)
+          .requestDismissKeyguard(this,
+            object : KeyguardManager.KeyguardDismissCallback() {
+              override fun onDismissSucceeded() {
+                Log.d(TAG, "Samsung keyguard dismissed")
+              }
+              override fun onDismissError() {
+                Log.w(TAG, "Keyguard dismiss error")
+              }
+            })
+      }
     }
   }
 

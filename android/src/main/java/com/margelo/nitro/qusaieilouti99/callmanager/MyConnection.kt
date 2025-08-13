@@ -1,19 +1,18 @@
 package com.margelo.nitro.qusaieilouti99.callmanager
 
 import android.content.Context
+import android.os.Build
 import android.os.ParcelUuid
-import android.telecom.CallAudioState
-import android.telecom.CallEndpoint
 import android.telecom.Connection
 import android.telecom.DisconnectCause
 import android.telecom.VideoProfile
 import android.util.Log
 import org.json.JSONObject
 import java.util.concurrent.Executor
-import android.os.OutcomeReceiver
-import android.telecom.CallEndpointException
 import java.util.UUID
 
+// Only import CallEndpoint-related classes for API 34+
+@Suppress("NewApi")
 class MyConnection(
     private val context: Context,
     val callId: String,
@@ -32,8 +31,10 @@ class MyConnection(
             Connection.CAPABILITY_MUTE or
             Connection.CAPABILITY_HOLD
 
-        setVideoState(if (callType == "Video") VideoProfile.STATE_BIDIRECTIONAL else VideoProfile.STATE_AUDIO_ONLY)
-        Log.d(TAG, "MyConnection for callId $callId created. Type: $callType, VideoState: ${getVideoState()}")
+        // Safe access to getVideoState() - use setVideoState instead of relying on getVideoState()
+        val videoState = if (callType == "Video") VideoProfile.STATE_BIDIRECTIONAL else VideoProfile.STATE_AUDIO_ONLY
+        setVideoState(videoState)
+        Log.d(TAG, "MyConnection for callId $callId created. Type: $callType, VideoState: $videoState")
 
         CallEngine.addTelecomConnection(callId, this)
         Log.d(TAG, "MyConnection for callId $callId created and added to CallEngine.")
@@ -90,16 +91,23 @@ class MyConnection(
         CallEngine.setMuted(callId, isMuted)
     }
 
-    override fun onCallEndpointChanged(callEndpoint: CallEndpoint) {
-        super.onCallEndpointChanged(callEndpoint)
-        Log.d(TAG, "Telecom reported active CallEndpoint for callId: $callId: ${callEndpoint.endpointName} (type: ${callEndpoint.endpointType})")
-        CallEngine.onTelecomAudioRouteChanged(callId, callEndpoint)
+    // CallEndpoint-related methods (API 34+)
+    @Suppress("NewApi")
+    override fun onCallEndpointChanged(callEndpoint: android.telecom.CallEndpoint) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            super.onCallEndpointChanged(callEndpoint)
+            Log.d(TAG, "Telecom reported active CallEndpoint for callId: $callId: ${callEndpoint.endpointName} (type: ${callEndpoint.endpointType})")
+            CallEngine.onTelecomAudioRouteChanged(callId, callEndpoint)
+        }
     }
 
-    override fun onAvailableCallEndpointsChanged(availableEndpoints: List<CallEndpoint>) {
-        super.onAvailableCallEndpointsChanged(availableEndpoints)
-        Log.d(TAG, "Telecom reported available CallEndpoints for callId: $callId: ${availableEndpoints.map { it.endpointName }}")
-        CallEngine.onTelecomAvailableEndpointsChanged(availableEndpoints)
+    @Suppress("NewApi")
+    override fun onAvailableCallEndpointsChanged(availableEndpoints: List<android.telecom.CallEndpoint>) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            super.onAvailableCallEndpointsChanged(availableEndpoints)
+            Log.d(TAG, "Telecom reported available CallEndpoints for callId: $callId: ${availableEndpoints.map { it.endpointName }}")
+            CallEngine.onTelecomAvailableEndpointsChanged(availableEndpoints)
+        }
     }
 
     override fun onPlayDtmfTone(digit: Char) {
@@ -148,24 +156,37 @@ class MyConnection(
         }
     }
 
-    // Method to set audio route through telecom using CallEndpoint API
-    fun setTelecomAudioRoute(endpoint: CallEndpoint) {
-        Log.d(TAG, "Requesting telecom audio route change to: ${endpoint.endpointName} (type: ${endpoint.endpointType}) for callId: $callId")
-        try {
-            // Use Context.getMainExecutor() for callback execution on the main thread
-            requestCallEndpointChange(endpoint, context.mainExecutor, object : OutcomeReceiver<Void?, CallEndpointException> {
-                override fun onResult(result: Void?) {
-                    Log.d(TAG, "CallEndpoint change request successful for ${endpoint.endpointName} for callId: $callId")
-                    // Telecom will eventually call onCallEndpointChanged with the new active endpoint
-                }
+    // Method to set audio route through telecom using CallEndpoint API (API 34+)
+    @Suppress("NewApi")
+    fun setTelecomAudioRoute(endpoint: android.telecom.CallEndpoint) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            Log.d(TAG, "Requesting telecom audio route change to: ${endpoint.endpointName} (type: ${endpoint.endpointType}) for callId: $callId")
+            try {
+                // Use Context.getMainExecutor() for callback execution on the main thread
+                requestCallEndpointChange(endpoint, context.mainExecutor, object : android.os.OutcomeReceiver<Void?, android.telecom.CallEndpointException> {
+                    override fun onResult(result: Void?) {
+                        Log.d(TAG, "CallEndpoint change request successful for ${endpoint.endpointName} for callId: $callId")
+                        // Telecom will eventually call onCallEndpointChanged with the new active endpoint
+                    }
 
-                override fun onError(error: CallEndpointException) {
-                    Log.e(TAG, "CallEndpoint change request failed for ${endpoint.endpointName} for callId: $callId: ${error.message}", error)
-                    // You might want to revert UI here or notify the user of failure
-                }
-            })
-        } catch (e: Exception) {
-            Log.e(TAG, "Error calling requestCallEndpointChange: ${e.message}", e)
+                    override fun onError(error: android.telecom.CallEndpointException) {
+                        Log.e(TAG, "CallEndpoint change request failed for ${endpoint.endpointName} for callId: $callId: ${error.message}", error)
+                        // You might want to revert UI here or notify the user of failure
+                    }
+                })
+            } catch (e: Exception) {
+                Log.e(TAG, "Error calling requestCallEndpointChange: ${e.message}", e)
+            }
+        } else {
+            Log.w(TAG, "CallEndpoint API not available on this Android version. Using fallback audio routing.")
+            // Use legacy audio routing
+            CallEngine.setLegacyAudioRoute(endpoint)
         }
+    }
+
+    // Fallback method for legacy audio routing (API 28-33)
+    fun setLegacyAudioRoute(route: String) {
+        Log.d(TAG, "Setting legacy audio route: $route for callId: $callId")
+        CallEngine.setLegacyAudioRouteDirect(route)
     }
 }
