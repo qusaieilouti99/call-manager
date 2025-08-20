@@ -47,10 +47,7 @@ class CallActivity : Activity(), CallEngine.CallEndListener {
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
-    val isSamsungBypass = intent.getBooleanExtra(
-      "SAMSUNG_LOCK_SCREEN_BYPASS", false
-    )
-    setupLockScreenBypass(isSamsungBypass)
+    setupLockScreenBypass() // Call without isSamsung parameter
 
     callId    = intent.getStringExtra("callId") ?: ""
     callType  = intent.getStringExtra("callType") ?: "Audio"
@@ -335,39 +332,14 @@ class CallActivity : Activity(), CallEngine.CallEndListener {
     finishCallActivity()
   }
 
-  private fun setupLockScreenBypass(isSamsung: Boolean) {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-      setShowWhenLocked(true)
-      setTurnScreenOn(true)
-    } else {
-      window.addFlags(
-        WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-        WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
-        WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
-      )
-    }
-    if (isSamsung) {
-      window.addFlags(
-        WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-        WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
-        WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
-        WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
-      )
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        (getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager)
-          .requestDismissKeyguard(this,
-            object : KeyguardManager.KeyguardDismissCallback() {
-              override fun onDismissSucceeded() {
-                Log.d(TAG, "Samsung keyguard dismissed")
-              }
-              override fun onDismissError() {
-                Log.w(TAG, "Keyguard dismiss error")
-              }
-            })
-      }
-    }
+  // Changed to no longer take isSamsung parameter, simplified logic for minSdk 28
+  private fun setupLockScreenBypass() {
+    // For minSdkVersion 28, setShowWhenLocked(true) and setTurnScreenOn(true) are always available (API 27).
+    setShowWhenLocked(true)
+    setTurnScreenOn(true)
   }
 
+  @Suppress("DEPRECATION") // Suppress warning for onBackPressed override
   override fun onBackPressed() {
     finishReason = FinishReason.MANUAL_DISMISS
     CallEngine.stopRingtone()
@@ -395,11 +367,8 @@ class CallActivity : Activity(), CallEngine.CallEndListener {
 
   private fun finishCallActivity() {
     if (isFinishing) return
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-      finishAndRemoveTask()
-    } else {
-      finish()
-    }
+    // finishAndRemoveTask() is available from API 21, so always applicable for minSdk 28.
+    finishAndRemoveTask()
   }
 
   private fun dp(v: Int): Int = TypedValue.applyDimension(

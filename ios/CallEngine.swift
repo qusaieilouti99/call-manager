@@ -3,6 +3,7 @@ import CallKit
 import AVFoundation
 import OSLog
 import WebRTC
+import UIKit
 
 class CallEngine {
     static let shared = CallEngine()
@@ -28,6 +29,12 @@ class CallEngine {
     // NEW: Track calls being answered via the startCall method
     private var answeringIncomingViaStartCall: Set<String> = [] // NEW
 
+    // NEW: State for CALL_STATE_CHANGED event
+    private var previousCallStateActive: Bool = false
+
+    // NEW: Manual control for idle timer (screen awake)
+    private var manualIdleTimerDisabled: Bool = false
+
     private init() {
         logger.info("CallEngine singleton created")
     }
@@ -43,6 +50,9 @@ class CallEngine {
         VoIPTokenManager.shared.setupPushKit()
         isInitialized = true
         logger.info("CallEngine initialized")
+        // NEW: Emit initial call state
+        updateOverallIdleTimerDisabledState() // Initial screen awake state
+        emitCallStateChanged() // Initial call state event
     }
 
     func setCanMakeMultipleCalls(_ allow: Bool) {
@@ -65,84 +75,86 @@ class CallEngine {
 
     // MARK: Incoming
 
-   func reportIncomingCall(callId: String,
-                          callType: String,
-                          displayName: String,
-                          pictureUrl: String? = nil,
-                          metadata: String? = nil,
-                          completion: ((Bool) -> Void)? = nil) {
+    func reportIncomingCall(callId: String,
+                            callType: String,
+                            displayName: String,
+                            pictureUrl: String? = nil,
+                            metadata: String? = nil,
+                            completion: ((Bool) -> Void)? = nil) {
 
-       logger.info("reportIncomingCall: \(callId), \(displayName)")
+        logger.info("reportIncomingCall: \(callId), \(displayName)")
 
-       // Check for exact duplicate (same callId already exists)
-       if activeCalls[callId] != nil {
-           logger.warning("🔄 Duplicate call detected for \(callId) - ignoring")
-           completion?(true)
-           return
-       }
+        // Check for exact duplicate (same callId already exists)
+        if activeCalls[callId] != nil {
+            logger.warning("🔄 Duplicate call detected for \(callId) - ignoring")
+            completion?(true)
+            return
+        }
 
-       if let m = metadata {
-           callMetadata[callId] = m
-           logger.info("metadata cached for \(callId)")
-       }
+        if let m = metadata {
+            callMetadata[callId] = m
+            logger.info("metadata cached for \(callId)")
+        }
 
-       // Check validation but don't return early - always report to CallKit first
-       let hasIncomingCollision = activeCalls.values.contains { $0.state == .incoming }
-       let hasActiveConflict = !canMakeMultipleCalls &&
-                              activeCalls.values.contains { $0.state == .active || $0.state == .held }
+        // Check validation but don't return early - always report to CallKit first
+        let hasIncomingCollision = activeCalls.values.contains { $0.state == .incoming }
+        let hasActiveConflict = !canMakeMultipleCalls &&
+                                activeCalls.values.contains { $0.state == .active || $0.state == .held }
 
-       let shouldEndImmediately = hasIncomingCollision || hasActiveConflict
+        let shouldEndImmediately = hasIncomingCollision || hasActiveConflict
 
-       if canMakeMultipleCalls {
-           activeCalls.values
-               .filter { $0.state == .active }
-               .forEach { call in
-                   logger.info("holding existing \(call.callId)")
-                   callKitManager.setCallOnHold(callId: call.callId, onHold: true)
-               }
-       }
+        if canMakeMultipleCalls {
+            activeCalls.values
+                .filter { $0.state == .active }
+                .forEach { call in
+                    logger.info("holding existing \(call.callId)")
+                    callKitManager.setCallOnHold(callId: call.callId, onHold: true)
+                }
+        }
 
-       // ALWAYS create and report to CallKit first
-       var info = CallInfo(callId: callId,
-                          callType: callType,
-                          displayName: displayName,
-                          pictureUrl: pictureUrl,
-                          state: .incoming)
-       activeCalls[callId] = info
-       currentCallId = callId
+        // ALWAYS create and report to CallKit first
+        var info = CallInfo(callId: callId,
+                            callType: callType,
+                            displayName: displayName,
+                            pictureUrl: pictureUrl,
+                            state: .incoming)
+        activeCalls[callId] = info
+        currentCallId = callId
+        updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
+        emitCallStateChanged() // NEW: Emit call state changed event
 
-       callKitManager.reportIncomingCall(callInfo: info) { [weak self] error in
-           guard let self = self else {
-               completion?(false)
-               return
-           }
+        callKitManager.reportIncomingCall(callInfo: info) { [weak self] error in
+            guard let self = self else {
+                completion?(false)
+                return
+            }
 
-           if let e = error {
-               self.logger.error("reportIncoming failed: \(e.localizedDescription)")
-               self.endCallInternal(callId: callId)
-               completion?(false)
-               return
-           }
+            if let e = error {
+                self.logger.error("reportIncoming failed: \(e.localizedDescription)")
+                self.endCallInternal(callId: callId)
+                completion?(false)
+                return
+            }
 
-           self.logger.info("✅ CallKit successfully reported call \(callId)")
-           completion?(true)
+            self.logger.info("✅ CallKit successfully reported call \(callId)")
+            completion?(true)
 
-           // Handle validation after CallKit success
-           if shouldEndImmediately {
-               self.logger.info("🔄 Ending call \(callId) due to validation rules")
+            // Handle validation after CallKit success
+            if shouldEndImmediately {
+                self.logger.info("🔄 Ending call \(callId) due to validation rules")
 
-               if hasIncomingCollision {
-                   self.emitEvent(.callRejected, data: ["callId": callId, "reason": "Another incoming exists"])
-               } else if hasActiveConflict {
-                   self.emitEvent(.callRejected, data: ["callId": callId, "reason": "Another call is active"])
-               }
+                if hasIncomingCollision {
+                    self.emitEvent(.callRejected, data: ["callId": callId, "reason": "Another incoming exists"])
+                } else if hasActiveConflict {
+                    self.emitEvent(.callRejected, data: ["callId": callId, "reason": "Another call is active"])
+                }
 
-               DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                   self.callKitManager.endCall(callId: callId)
-               }
-           }
-       }
-   }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    self.callKitManager.endCall(callId: callId)
+                }
+            }
+        }
+    }
 
     // MARK: Outgoing
 
@@ -179,6 +191,8 @@ class CallEngine {
                             state: .dialing)
         activeCalls[callId] = info
         currentCallId = callId
+        updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
+        emitCallStateChanged() // NEW: Emit call state changed event
 
         // Mark video calls for speaker activation
         if callType.lowercased().contains("video") {
@@ -259,6 +273,8 @@ class CallEngine {
                             state: .dialing)
         activeCalls[callId] = info
         currentCallId = callId
+        updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
+        emitCallStateChanged() // NEW: Emit call state changed event
 
         // Mark video calls for speaker activation
         if callType.lowercased().contains("video") {
@@ -319,7 +335,6 @@ class CallEngine {
         callKitManager.updateCall(callId: callId, displayName: callerName)
     }
 
-
     // MARK: Internal
     private func coreCallAnswered(callId: String, isLocalAnswer: Bool) {
         logger.info("📞 Core call answered: callId=\(callId), isLocalAnswer=\(isLocalAnswer)")
@@ -334,6 +349,9 @@ class CallEngine {
         self.activeCalls[callId] = callInfo
         self.currentCallId = callId
         logger.info("📞 Call state updated: \(previousState.stringValue) → \(CallState.active.stringValue)")
+
+        updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
+        emitCallStateChanged() // NEW: Emit call state changed event
 
         // Mark video calls for speaker activation on answer
         if callInfo.callType.lowercased().contains("video") {
@@ -389,6 +407,8 @@ class CallEngine {
             data["metadata"] = m
         }
         emitEvent(.callEnded, data: data)
+        updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
+        emitCallStateChanged() // NEW: Emit call state changed event
     }
 
     // MARK: Audio
@@ -414,7 +434,7 @@ class CallEngine {
     private func emitEvent(_ type: CallEventType, data: [String: Any]) {
         logger.info("emitEvent: \(type.stringValue)")
         do {
-            let json = try JSONSerialization.data(withJSONObject: data, options: .prettyPrinted)
+            let json = try JSONSerialization.data(withJSONObject: data, options: []) // Removed prettyPrinted for smaller payload
             let s = String(data: json, encoding: .utf8) ?? "{}"
             if let h = eventHandler {
                 h(type, s)
@@ -450,6 +470,16 @@ class CallEngine {
         emitEvent(.outgoingCallAnswered, data: data)
     }
 
+    // NEW: Emit CALL_STATE_CHANGED event
+    private func emitCallStateChanged() {
+        let currentIsActive = hasActiveCalls()
+        if currentIsActive != previousCallStateActive {
+            logger.info("📞 CALL_STATE_CHANGED: isActive=\(currentIsActive)")
+            emitEvent(.callStateChanged, data: ["isActive": currentIsActive])
+            previousCallStateActive = currentIsActive
+        }
+    }
+
     // Updated to check all relevant call states, not just active
     func hasActiveCalls() -> Bool {
         logger.debug("hasActiveCalls check")
@@ -462,6 +492,25 @@ class CallEngine {
         logger.debug("Call states: \(callStates)")
         return hasRelevantCalls
     }
+
+    // MARK: Screen Awake Management
+
+    // NEW: Public method for JS to control screen awake
+    func setIdleTimerDisabled(shouldDisable: Bool) {
+        logger.info("setIdleTimerDisabled (JS requested): \(shouldDisable)")
+        manualIdleTimerDisabled = shouldDisable
+        updateOverallIdleTimerDisabledState()
+    }
+
+    // NEW: Internal method to determine and set final idle timer state
+    private func updateOverallIdleTimerDisabledState() {
+        let shouldDisable = manualIdleTimerDisabled || hasActiveCalls()
+        DispatchQueue.main.async {
+            UIApplication.shared.isIdleTimerDisabled = shouldDisable
+            self.logger.info("Screen awake state updated. isIdleTimerDisabled = \(shouldDisable) (manual=\(self.manualIdleTimerDisabled), hasCalls=\(self.hasActiveCalls()))")
+        }
+    }
+
 
     // MARK: Helpers
 
@@ -505,6 +554,8 @@ extension CallEngine: CallKitManagerDelegate {
             emitEvent(.callUnheld, data: ["callId": callId])
         }
         activeCalls[callId] = info
+        updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
+        emitCallStateChanged() // NEW: Emit call state changed event
     }
 
     func callKitManager(_ manager: CallKitManager, didSetMuted callId: String, muted: Bool) {
@@ -535,6 +586,8 @@ extension CallEngine: CallKitManagerDelegate {
 
             emitOutgoingCallAnsweredWithMetadata(callId: callId)
         }
+        updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
+        emitCallStateChanged() // NEW: Emit call state changed event
     }
 
     func callKitManager(_ manager: CallKitManager, didActivateAudioSession session: AVAudioSession) {

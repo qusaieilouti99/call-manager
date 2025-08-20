@@ -51,7 +51,8 @@ class CallManager : HybridCallManagerSpec() {
     override fun keepScreenAwake(keepAwake: Boolean): Unit {
         Log.d(TAG, "keepScreenAwake requested: $keepAwake")
         ensureInitialized()
-        CallEngine.keepScreenAwake(keepAwake)
+        // Delegate screen awake control to CallEngine's unified mechanism
+        CallEngine.setIdleTimerDisabled(keepAwake)
     }
 
     override fun addListener(listener: (event: CallEventType, payload: String) -> Unit): () -> Unit {

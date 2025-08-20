@@ -1,6 +1,7 @@
 // CallEventType.ts
 export type CallEventType =
-  'AUDIO_DEVICES_CHANGED'
+  | 'CALL_STATE_CHANGED' // I Added it here
+  | 'AUDIO_DEVICES_CHANGED'
   | 'AUDIO_ROUTE_CHANGED'
   | 'CALL_HELD'
   | 'CALL_UNHELD'

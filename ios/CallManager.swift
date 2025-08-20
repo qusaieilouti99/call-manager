@@ -42,10 +42,7 @@ public class CallManager: HybridCallManagerSpec {
 
   public func keepScreenAwake(keepAwake: Bool) throws {
     logger.info("🎯 keepScreenAwake ▶ js → native: \(keepAwake)")
-    DispatchQueue.main.async {
-      UIApplication.shared.isIdleTimerDisabled = keepAwake
-      self.logger.info("🎯 isIdleTimerDisabled = \(keepAwake)")
-    }
+    CallEngine.shared.setIdleTimerDisabled(shouldDisable: keepAwake)
   }
 
   public func addListener(listener: @escaping (CallEventType, String) -> Void) throws
@@ -82,7 +79,7 @@ public class CallManager: HybridCallManagerSpec {
                                 targetName: String,
                                 metadata: String?) throws
   {
-    logger.info("🎯 startOutgoingCall ▶ js → native: \(callId), type=\(callType)")
+    logger.info("🎯 reportIncomingCall ▶ js → native: \(callId), type=\(callType)")
     if let m = metadata { logger.debug("🎯 metadata.len=\(m.count)") }
     CallEngine.shared.reportIncomingCall(
       callId: callId,

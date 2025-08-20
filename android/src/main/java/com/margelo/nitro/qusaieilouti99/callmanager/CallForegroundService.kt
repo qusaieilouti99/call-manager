@@ -152,6 +152,8 @@ class CallForegroundService : Service() {
         Log.d(TAG, "onTaskRemoved: $removed")
 
         // Only terminate if main app was removed, not CallActivity
+        // For min SDK 28, ActivityManager.getAppTasks() is preferred.
+        // The check for !CallActivity::class.java.name is robust.
         if (removed != CallActivity::class.java.name) {
             Log.d(TAG, "Main app task removed - terminating")
             CallEngine.onApplicationTerminate()

@@ -2,6 +2,7 @@ package com.margelo.nitro.qusaieilouti99.callmanager
 
 import android.app.Activity
 import android.app.ActivityManager
+import android.app.Application
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,7 +11,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
-import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
 import android.media.RingtoneManager
@@ -23,7 +23,6 @@ import android.os.PowerManager
 import android.os.ParcelUuid
 import android.os.VibrationEffect
 import android.os.Vibrator
-import android.telecom.CallAudioState
 import android.telecom.Connection
 import android.telecom.DisconnectCause
 import android.telecom.PhoneAccount
@@ -39,6 +38,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 import android.app.KeyguardManager
 import java.util.UUID
 import android.provider.Settings // Import for Settings.canDrawOverlays and ACTION_MANAGE_OVERLAY_PERMISSION
+import android.view.WindowManager // For WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+// The CallEventType enum is now imported from its generated package, no manual definition needed.
+
 
 /**
  * Core call‐management engine. Manages self-managed telecom calls,
@@ -76,7 +78,7 @@ object CallEngine {
   private var ringbackPlayer: MediaPlayer? = null
   private var vibrator: Vibrator? = null
   private var audioManager: AudioManager? = null
-  private var wakeLock: PowerManager.WakeLock? = null
+  private var wakeLock: PowerManager.WakeLock? = null // Using SCREEN_BRIGHT_WAKE_LOCK now
 
   private val activeCalls = ConcurrentHashMap<String, CallInfo>()
   private val telecomConnections = ConcurrentHashMap<String, Connection>()
@@ -102,6 +104,57 @@ object CallEngine {
   private var wasManuallySetAudioRoute: Boolean = false
   private var callStartTime: Long = 0
 
+  // NEW: State for CALL_STATE_CHANGED event
+  private var previousCallStateActive: Boolean = false
+
+  // NEW: Manual control for idle timer (screen awake)
+  private var manualIdleTimerDisabled: Boolean = false
+
+  // NEW: Activity lifecycle tracking for robust foreground detection
+  // This counts *all* activities of the app.
+  private var foregroundActivitiesCount = 0 // Tracks how many of our activities are in resumed state
+  private var isAppCurrentlyVisible = false // Reflects if any of our activities are in foreground
+
+  // This specifically tracks if MainActivity is in the foreground
+  private var isMainActivityCurrentlyVisible = false // NEW: Track MainActivity visibility
+
+  private val lifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
+      override fun onActivityResumed(activity: Activity) {
+          if (activity.packageName == appContext?.packageName) {
+              foregroundActivitiesCount++
+              if (foregroundActivitiesCount > 0) {
+                  isAppCurrentlyVisible = true
+              }
+              if (activity.javaClass.simpleName == "MainActivity") {
+                  isMainActivityCurrentlyVisible = true
+                  Log.d(TAG, "MainActivity is now visible (resumed)")
+              }
+              Log.d(TAG, "App is now visible (resumed activity: ${activity.javaClass.simpleName}), total visible: $foregroundActivitiesCount")
+          }
+      }
+
+      override fun onActivityPaused(activity: Activity) {
+          if (activity.packageName == appContext?.packageName) {
+              foregroundActivitiesCount--
+              if (foregroundActivitiesCount <= 0) { // Only set to false if ALL activities are paused
+                  isAppCurrentlyVisible = false
+              }
+              if (activity.javaClass.simpleName == "MainActivity") {
+                  isMainActivityCurrentlyVisible = false
+                  Log.d(TAG, "MainActivity is no longer visible (paused)")
+              }
+              Log.d(TAG, "App is no longer visible (paused activity: ${activity.javaClass.simpleName}), total visible: $foregroundActivitiesCount")
+          }
+      }
+
+      override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+      override fun onActivityStarted(activity: Activity) {}
+      override fun onActivityStopped(activity: Activity) {}
+      override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+      override fun onActivityDestroyed(activity: Activity) {}
+  }
+
+
   interface LockScreenBypassCallback {
     fun onLockScreenBypassChanged(shouldBypass: Boolean)
   }
@@ -111,10 +164,12 @@ object CallEngine {
       if (isInitialized.compareAndSet(false, true)) {
         appContext = context.applicationContext
         audioManager = appContext?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        // Register lifecycle callbacks
+        (appContext as? Application)?.registerActivityLifecycleCallbacks(lifecycleCallbacks)
         Log.d(TAG, "CallEngine initialized successfully")
-        if (isCallActive()) {
-          startForegroundService()
-        }
+        // Initial state emission
+        updateOverallIdleTimerDisabledState()
+        emitCallStateChanged()
       }
     }
   }
@@ -142,13 +197,25 @@ object CallEngine {
   }
 
   fun emitEvent(type: CallEventType, data: JSONObject) {
-    Log.d(TAG, "Emitting event: $type")
+    Log.d(TAG, "Emitting event: ${type.name}") // Use type.name for string value
     val dataString = data.toString()
     if (eventHandler != null) {
       eventHandler?.invoke(type, dataString)
     } else {
-      Log.d(TAG, "No event handler, caching event: $type")
+      Log.d(TAG, "No event handler, caching event: ${type.name}") // Use type.name
       cachedEvents.add(Pair(type, dataString))
+    }
+  }
+
+  // NEW: Emit CALL_STATE_CHANGED event
+  private fun emitCallStateChanged() {
+    val currentIsActive = CallEngine.isCallActive()
+    if (currentIsActive != previousCallStateActive) {
+        Log.d(TAG, "CALL_STATE_CHANGED: isActive=$currentIsActive")
+        emitEvent(CallEventType.CALL_STATE_CHANGED, JSONObject().apply {
+            put("isActive", currentIsActive)
+        })
+        previousCallStateActive = currentIsActive
     }
   }
 
@@ -190,7 +257,7 @@ object CallEngine {
   }
 
   private fun updateLockScreenBypass() {
-    val shouldBypass = isCallActive()
+    val shouldBypass = CallEngine.isCallActive()
     if (lockScreenBypassActive != shouldBypass) {
       lockScreenBypassActive = shouldBypass
       Log.d(TAG, "Lock screen bypass state changed: $lockScreenBypassActive")
@@ -227,7 +294,7 @@ object CallEngine {
   }
 
   fun getCurrentCallState(): String {
-    val calls = getActiveCalls()
+    val calls = CallEngine.getActiveCalls()
     val jsonArray = JSONArray()
     calls.forEach {
       jsonArray.put(it.toJsonObject())
@@ -280,12 +347,16 @@ object CallEngine {
     currentCallId = callId
     Log.d(TAG, "Call $callId added to activeCalls. State: INCOMING")
 
+    startForegroundService() // Ensure foreground service is started for incoming
+    updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
+    emitCallStateChanged() // NEW: Emit call state changed event
+
     showIncomingCallUI(callId, displayName, callType, pictureUrl)
     registerPhoneAccount()
 
     val telecomManager =
       requireContext().getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-    val phoneAccountHandle = getPhoneAccountHandle()
+    val phoneAccountHandle = CallEngine.getPhoneAccountHandle()
     val extras = Bundle().apply {
       putString(MyConnectionService.EXTRA_CALL_ID, callId)
       putString(MyConnectionService.EXTRA_CALL_TYPE, callType)
@@ -298,11 +369,10 @@ object CallEngine {
 
     try {
       telecomManager.addNewIncomingCall(phoneAccountHandle, extras)
-      startForegroundService()
       Log.d(TAG, "Successfully reported incoming call to TelecomManager for $callId")
     } catch (e: Exception) {
       Log.e(TAG, "Failed to report incoming call: ${e.message}", e)
-      endCallInternal(callId)
+      endCallInternal(callId) // Clean up if Telecom fails
     }
 
     updateLockScreenBypass()
@@ -340,11 +410,15 @@ object CallEngine {
     currentCallId = callId
     Log.d(TAG, "Call $callId added to activeCalls. State: DIALING")
 
+    startForegroundService() // Ensure foreground service is started for outgoing
+    updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
+    emitCallStateChanged() // NEW: Emit call state changed event
+
     registerPhoneAccount()
 
     val telecomManager =
       context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-    val phoneAccountHandle = getPhoneAccountHandle()
+    val phoneAccountHandle = CallEngine.getPhoneAccountHandle()
     val addressUri = Uri.fromParts(PhoneAccount.SCHEME_TEL, targetName, null)
 
     val outgoingExtrasForConnectionService = Bundle().apply {
@@ -365,13 +439,11 @@ object CallEngine {
 
     try {
       telecomManager.placeCall(addressUri, placeCallExtras)
-      startForegroundService()
-      bringAppToForeground()
-      keepScreenAwake(true)
+      bringAppToForeground() // Try to bring app to foreground
       Log.d(TAG, "Successfully reported outgoing call to TelecomManager")
     } catch (e: Exception) {
       Log.e(TAG, "Failed to start outgoing call: ${e.message}", e)
-      endCallInternal(callId)
+      endCallInternal(callId) // Clean up if Telecom fails
     }
 
     updateLockScreenBypass()
@@ -390,7 +462,7 @@ object CallEngine {
     if (existingCallInfo != null && existingCallInfo.state == CallState.INCOMING) {
       // Scenario 1: Call with this ID is already incoming, answer it.
       Log.d(TAG, "Call $callId is incoming, answering it directly via startCall.")
-      answerCall(callId, isLocalAnswer = false) // Remote party answered
+      answerCall(callId, isLocalAnswer = false) // Remote party answered, so not local UI initiated
       return
     }
 
@@ -420,10 +492,14 @@ object CallEngine {
     currentCallId = callId
     Log.d(TAG, "Call $callId added to activeCalls. Initial state: DIALING (for Telecom)")
 
+    startForegroundService() // Ensure foreground service is started
+    updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
+    emitCallStateChanged() // NEW: Emit call state changed event
+
     registerPhoneAccount()
 
     val telecomManager = requireContext().getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-    val phoneAccountHandle = getPhoneAccountHandle()
+    val phoneAccountHandle = CallEngine.getPhoneAccountHandle()
     val addressUri = Uri.fromParts(PhoneAccount.SCHEME_TEL, targetName, null)
 
     val outgoingExtrasForConnectionService = Bundle().apply {
@@ -443,16 +519,14 @@ object CallEngine {
 
     try {
       telecomManager.placeCall(addressUri, placeCallExtras)
-      startForegroundService()
-      bringAppToForeground()
-      keepScreenAwake(true)
+      bringAppToForeground() // Try to bring app to foreground
       Log.d(TAG, "Successfully reported outgoing call (to be immediately active) to TelecomManager for $callId")
 
       // Immediately mark as answered for "startCall" behavior
-      answerCall(callId, isLocalAnswer = false) // Remote party answered
+      answerCall(callId, isLocalAnswer = false) // Remote party answered, not local UI initiated
     } catch (e: Exception) {
       Log.e(TAG, "Failed to start call as active: ${e.message}", e)
-      endCallInternal(callId)
+      endCallInternal(callId) // Clean up if Telecom fails
     }
     updateLockScreenBypass()
   }
@@ -505,10 +579,10 @@ object CallEngine {
       }
     }
 
-    bringAppToForeground()
-    startForegroundService()
-    keepScreenAwake(true)
-    updateLockScreenBypass()
+    startForegroundService() // Update foreground service status
+    bringAppToForeground() // Always try to bring app to foreground when answering
+    updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
+    emitCallStateChanged() // NEW: Emit call state changed event
 
     setAudioMode()
 
@@ -598,6 +672,7 @@ object CallEngine {
     updateForegroundNotification()
     emitEvent(CallEventType.CALL_HELD, JSONObject().put("callId", callId))
     updateLockScreenBypass()
+    emitCallStateChanged() // NEW: Emit call state changed event
   }
 
   fun unholdCall(callId: String) {
@@ -621,6 +696,7 @@ object CallEngine {
     updateForegroundNotification()
     emitEvent(CallEventType.CALL_UNHELD, JSONObject().put("callId", callId))
     updateLockScreenBypass()
+    emitCallStateChanged() // NEW: Emit call state changed event
   }
 
   fun muteCall(callId: String) {
@@ -669,14 +745,12 @@ object CallEngine {
       endCallInternal(callId)
     }
 
-    activeCalls.clear()
-    telecomConnections.clear()
-    callMetadata.clear()
-    callAnswerStates.clear()
-    currentCallId = null
-
-    cleanup()
+    // Explicitly ensure cleanup and state reset if somehow not all calls ended cleanly
+    if (activeCalls.isEmpty()) {
+      cleanup()
+    }
     updateLockScreenBypass()
+    emitCallStateChanged() // NEW: Emit call state changed event
   }
 
   private fun endCallInternal(callId: String) {
@@ -719,12 +793,13 @@ object CallEngine {
     }
 
     if (activeCalls.isEmpty()) {
-      cleanup()
+      cleanup() // Full cleanup if no more calls
     } else {
-      updateForegroundNotification()
+      updateForegroundNotification() // Update notification for remaining calls
     }
 
     updateLockScreenBypass()
+    emitCallStateChanged() // NEW: Emit call state changed event
 
     for (listener in callEndListeners) {
       mainHandler.post {
@@ -739,8 +814,8 @@ object CallEngine {
     emitEvent(CallEventType.CALL_ENDED, JSONObject().apply {
       put("callId", callId)
       metadata?.let {
-        try { put("metadata", JSONObject(it)) }
-        catch (e: Exception) { put("metadata", it) }
+        try { put("metadata", JSONObject(it))
+        } catch (e: Exception) { put("metadata", it) }
       }
     })
   }
@@ -751,8 +826,9 @@ object CallEngine {
   @Suppress("NewApi")
   fun onTelecomAvailableEndpointsChanged(endpoints: List<android.telecom.CallEndpoint>) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-      availableCallEndpoints = endpoints
-      Log.d(TAG, "Available CallEndpoints updated: ${endpoints.map { "${it.endpointName}(${mapCallEndpointTypeToString(it.endpointType)})" }}")
+      @Suppress("UNCHECKED_CAST")
+      availableCallEndpoints = endpoints as? List<Any> ?: emptyList() // Store as Any for compatibility
+      Log.d(TAG, "Available CallEndpoints updated: ${endpoints.map { "${it.endpointName}(${CallEngine.mapCallEndpointTypeToString(it.endpointType)})" }}")
       emitAudioDevicesChanged()
     }
   }
@@ -760,9 +836,9 @@ object CallEngine {
   @Suppress("NewApi")
   fun onTelecomAudioRouteChanged(callId: String, callEndpoint: android.telecom.CallEndpoint) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-      Log.d(TAG, "Telecom audio route changed for $callId: endpoint=${callEndpoint.endpointName} (type=${mapCallEndpointTypeToString(callEndpoint.endpointType)})")
+      Log.d(TAG, "Telecom audio route changed for $callId: endpoint=${callEndpoint.endpointName} (type=${CallEngine.mapCallEndpointTypeToString(callEndpoint.endpointType)})")
       currentActiveCallEndpoint = callEndpoint
-      emitAudioRouteChanged(mapCallEndpointTypeToString(callEndpoint.endpointType))
+      emitAudioRouteChanged(CallEngine.mapCallEndpointTypeToString(callEndpoint.endpointType))
     }
   }
 
@@ -776,14 +852,20 @@ object CallEngine {
 
   @Suppress("NewApi")
   private fun getModernAudioDevices(): AudioRoutesInfo {
+    @Suppress("UNCHECKED_CAST")
     val endpoints = availableCallEndpoints as? List<android.telecom.CallEndpoint> ?: emptyList()
-    val devices = endpoints.map { StringHolder(mapCallEndpointTypeToString(it.endpointType)) }.toMutableSet()
+    val devices = endpoints.map { StringHolder(CallEngine.mapCallEndpointTypeToString(it.endpointType)) }.toMutableSet()
 
-    if (!devices.any { it.value == "Earpiece" }) devices.add(StringHolder("Earpiece"))
-    if (!devices.any { it.value == "Speaker" }) devices.add(StringHolder("Speaker"))
+    // Ensure Earpiece and Speaker are always listed if they are valid output types
+    if (endpoints.none { it.endpointType == android.telecom.CallEndpoint.TYPE_EARPIECE }) {
+        devices.add(StringHolder("Earpiece"))
+    }
+    if (endpoints.none { it.endpointType == android.telecom.CallEndpoint.TYPE_SPEAKER }) {
+        devices.add(StringHolder("Speaker"))
+    }
 
     val currentEndpoint = currentActiveCallEndpoint as? android.telecom.CallEndpoint
-    val current = currentEndpoint?.let { mapCallEndpointTypeToString(it.endpointType) } ?: "Unknown"
+    val current = currentEndpoint?.let { CallEngine.mapCallEndpointTypeToString(it.endpointType) } ?: "Unknown"
 
     Log.d(TAG, "Modern audio devices: ${devices.map { it.value }}, current: $current")
     return AudioRoutesInfo(devices.toTypedArray(), current)
@@ -809,20 +891,21 @@ object CallEngine {
 
   @Suppress("NewApi")
   private fun setModernAudioRoute(route: String) {
-    val telecomEndpointType = mapStringToCallEndpointType(route)
+    val telecomEndpointType = CallEngine.mapStringToCallEndpointType(route)
+    @Suppress("UNCHECKED_CAST")
     val endpoints = availableCallEndpoints as? List<android.telecom.CallEndpoint> ?: emptyList()
 
     val targetEndpoint = endpoints.find { it.endpointType == telecomEndpointType }
-        ?: getOrCreateGenericCallEndpoint(telecomEndpointType, route)
+        ?: CallEngine.getOrCreateGenericCallEndpoint(telecomEndpointType, route)
 
     if (targetEndpoint != null) {
       currentCallId?.let { callId ->
         telecomConnections[callId]?.let { connection ->
           if (connection is MyConnection) {
-            Log.d(TAG, "Requesting modern telecom audio route to: ${targetEndpoint.endpointName} (type: ${mapCallEndpointTypeToString(targetEndpoint.endpointType)})")
+            Log.d(TAG, "Requesting modern telecom audio route to: ${targetEndpoint.endpointName} (type: ${CallEngine.mapCallEndpointTypeToString(targetEndpoint.endpointType)})")
             connection.setTelecomAudioRoute(targetEndpoint)
           } else {
-            Log.w(TAG, "Telecom connection for $callId is not MyConnection instance.")
+            Log.w(TAG, "Telecom connection for $callId is not MyConnection instance. Cannot set modern audio route.")
           }
         } ?: Log.w(TAG, "No telecom connection found for $callId to set audio route.")
       } ?: Log.w(TAG, "No current call ID to set audio route.")
@@ -839,35 +922,44 @@ object CallEngine {
     try {
       when (route) {
         "Speaker" -> {
+          @Suppress("DEPRECATION")
           am.isSpeakerphoneOn = true
-          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am.isBluetoothScoOn) {
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && @Suppress("DEPRECATION") am.isBluetoothScoOn) {
+            @Suppress("DEPRECATION")
             am.stopBluetoothSco()
           }
           legacyCurrentAudioRoute = "Speaker"
         }
         "Earpiece" -> {
+          @Suppress("DEPRECATION")
           am.isSpeakerphoneOn = false
-          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am.isBluetoothScoOn) {
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && @Suppress("DEPRECATION") am.isBluetoothScoOn) {
+            @Suppress("DEPRECATION")
             am.stopBluetoothSco()
           }
           legacyCurrentAudioRoute = "Earpiece"
         }
         "Bluetooth" -> {
+          @Suppress("DEPRECATION")
           am.isSpeakerphoneOn = false
           if (isBluetoothDeviceConnected()) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+              @Suppress("DEPRECATION")
               am.startBluetoothSco()
             }
             legacyCurrentAudioRoute = "Bluetooth"
           } else {
             Log.w(TAG, "No Bluetooth device connected, falling back to Earpiece")
+            @Suppress("DEPRECATION")
             am.isSpeakerphoneOn = false
             legacyCurrentAudioRoute = "Earpiece"
           }
         }
         "Headset" -> {
+          @Suppress("DEPRECATION")
           am.isSpeakerphoneOn = false
-          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am.isBluetoothScoOn) {
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && @Suppress("DEPRECATION") am.isBluetoothScoOn) {
+            @Suppress("DEPRECATION")
             am.stopBluetoothSco()
           }
           if (isWiredHeadsetConnected()) {
@@ -879,8 +971,10 @@ object CallEngine {
         }
         else -> {
           Log.w(TAG, "Unknown legacy audio route: $route, falling back to Earpiece")
+          @Suppress("DEPRECATION")
           am.isSpeakerphoneOn = false
-          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am.isBluetoothScoOn) {
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && @Suppress("DEPRECATION") am.isBluetoothScoOn) {
+            @Suppress("DEPRECATION")
             am.stopBluetoothSco()
           }
           legacyCurrentAudioRoute = "Earpiece"
@@ -896,12 +990,8 @@ object CallEngine {
   }
 
   // Legacy method for MyConnection fallback
-  fun setLegacyAudioRoute(endpoint: Any) {
-    if (endpoint is String) {
+  fun setLegacyAudioRoute(endpoint: String) {
       setLegacyAudioRouteDirect(endpoint)
-    } else {
-      Log.w(TAG, "Invalid endpoint type for legacy audio routing")
-    }
   }
 
   fun setInitialCallAudioRoute(callId: String, callType: String) {
@@ -921,9 +1011,9 @@ object CallEngine {
 
     mainHandler.postDelayed({
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-        setModernAudioRoute(targetRoute)
+        CallEngine.setModernAudioRoute(targetRoute)
       } else {
-        setLegacyAudioRouteDirect(targetRoute)
+        CallEngine.setLegacyAudioRouteDirect(targetRoute)
       }
     }, 500L)
   }
@@ -934,12 +1024,14 @@ object CallEngine {
   }
 
   private fun resetAudioMode() {
-    if (activeCalls.isEmpty()) {
+    if (CallEngine.activeCalls.isEmpty()) {
       audioManager?.let { am ->
         am.mode = AudioManager.MODE_NORMAL
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am.isBluetoothScoOn) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && @Suppress("DEPRECATION") am.isBluetoothScoOn) {
+          @Suppress("DEPRECATION")
           am.stopBluetoothSco()
         }
+        @Suppress("DEPRECATION")
         am.isSpeakerphoneOn = false
       }
 
@@ -955,7 +1047,7 @@ object CallEngine {
   }
 
   @Suppress("NewApi")
-  private fun mapCallEndpointTypeToString(type: Int): String {
+  fun mapCallEndpointTypeToString(type: Int): String { // Made public
     return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
       when (type) {
         android.telecom.CallEndpoint.TYPE_EARPIECE -> "Earpiece"
@@ -966,12 +1058,16 @@ object CallEngine {
         else -> "Unknown"
       }
     } else {
+      // Fallback for API < 34. These types technically don't exist on older APIs,
+      // but the `Int` value can be passed. Return "Unknown" as a safe default
+      // if this is ever called with an integer that doesn't correspond to a known type on older APIs.
+      // This function is still safe because the `when` block with API 34+ constants is inside the `if` check.
       "Unknown"
     }
   }
 
   @Suppress("NewApi")
-  private fun mapStringToCallEndpointType(typeString: String): Int {
+  fun mapStringToCallEndpointType(typeString: String): Int { // Made public
     return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
       when (typeString) {
         "Earpiece" -> android.telecom.CallEndpoint.TYPE_EARPIECE
@@ -982,12 +1078,12 @@ object CallEngine {
         else -> android.telecom.CallEndpoint.TYPE_UNKNOWN
       }
     } else {
-      0 // Fallback value
+      0 // Fallback value for API < 34. Return a generic or `TYPE_UNKNOWN` (which is 0).
     }
   }
 
   @Suppress("NewApi")
-  private fun getOrCreateGenericCallEndpoint(type: Int, name: String): android.telecom.CallEndpoint? {
+  fun getOrCreateGenericCallEndpoint(type: Int, name: String): android.telecom.CallEndpoint? { // Made public
     return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
       when (type) {
         android.telecom.CallEndpoint.TYPE_EARPIECE -> android.telecom.CallEndpoint(name, type, ParcelUuid(UUID.nameUUIDFromBytes("Earpiece_Default".toByteArray())))
@@ -997,7 +1093,7 @@ object CallEngine {
         else -> null
       }
     } else {
-      null
+      null // Return null for API < 34 as CallEndpoint doesn't exist
     }
   }
 
@@ -1052,7 +1148,7 @@ object CallEngine {
   }
 
   private fun emitAudioRouteChanged(currentRoute: String) {
-    val info = getAudioDevices()
+    val info = CallEngine.getAudioDevices()
     val deviceStrings = info.devices.map { it.value }
     val payload = JSONObject().apply {
       put("devices", JSONArray(deviceStrings))
@@ -1063,7 +1159,7 @@ object CallEngine {
   }
 
   private fun emitAudioDevicesChanged() {
-    val info = getAudioDevices()
+    val info = CallEngine.getAudioDevices()
     val deviceStrings = info.devices.map { it.value }
     val payload = JSONObject().apply {
       put("devices", JSONArray(deviceStrings))
@@ -1075,31 +1171,72 @@ object CallEngine {
 
   // ====== END IMPROVED AUDIO ROUTING SYSTEM ======
 
+  // NEW: Manual control for idle timer disabled
+  fun setIdleTimerDisabled(shouldDisable: Boolean) {
+      Log.d(TAG, "setIdleTimerDisabled (JS requested): $shouldDisable")
+      manualIdleTimerDisabled = shouldDisable
+      CallEngine.updateOverallIdleTimerDisabledState()
+  }
+
+  // NEW: Internal method to determine and set final idle timer state
+  private fun updateOverallIdleTimerDisabledState() {
+      // Screen should stay awake if:
+      // 1. Manually requested (e.g., from JS)
+      // 2. Any call is active (INCOMING, DIALING, ACTIVE, HELD)
+      // 3. Any activity of the app is currently visible (to ensure screen stays on while using the app even if no call is active)
+      val shouldDisable = manualIdleTimerDisabled || CallEngine.isCallActive() || isAppCurrentlyVisible
+      mainHandler.post {
+          appContext?.let {
+              if (it is Activity) {
+                  // For an Activity context, use FLAG_KEEP_SCREEN_ON
+                  if (shouldDisable) {
+                      it.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  } else {
+                      it.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  }
+                  Log.d(TAG, "Activity screen awake state updated. FLAG_KEEP_SCREEN_ON = $shouldDisable (manual=${CallEngine.manualIdleTimerDisabled}, hasCalls=${CallEngine.isCallActive()}, appVisible=${isAppCurrentlyVisible})")
+              } else {
+                  // For application context, PowerManager.WakeLock is appropriate for keeping CPU/screen on.
+                  val powerManager = it.getSystemService(Context.POWER_SERVICE) as PowerManager
+                  if (shouldDisable) {
+                      if (wakeLock == null || wakeLock?.isHeld == false) {
+                          // Use SCREEN_DIM_WAKE_LOCK to keep the screen on but dim.
+                          // ACQUIRE_CAUSES_WAKEUP is important to turn the screen on if it's off.
+                          @Suppress("DEPRECATION")
+                          wakeLock = powerManager.newWakeLock(
+                              PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                              "CallEngine:ScreenWakeLock"
+                          )
+                          // Acquire with a reasonable timeout. The foreground service ensures re-acquisition if needed.
+                          wakeLock?.acquire(60 * 60 * 1000L /* 1 hour */)
+                          Log.d(TAG, "Acquired SCREEN_DIM_WAKE_LOCK (from Application context)")
+                      }
+                  } else {
+                      wakeLock?.let { wl ->
+                          if (wl.isHeld) {
+                              wl.release()
+                              Log.d(TAG, "Released SCREEN_DIM_WAKE_LOCK (from Application context)")
+                          }
+                      }
+                      wakeLock = null
+                  }
+                  Log.d(TAG, "Application context screen awake state updated. WakeLock status: ${wakeLock?.isHeld ?: false} (manual=${CallEngine.manualIdleTimerDisabled}, hasCalls=${CallEngine.isCallActive()}, appVisible=${isAppCurrentlyVisible})")
+              }
+          } ?: Log.e(TAG, "Cannot update screen awake state, appContext is null.")
+      }
+  }
+
+
+  // Replaced original `keepScreenAwake` with the internal one. The CallManager will now call `setIdleTimerDisabled`.
   fun keepScreenAwake(keepAwake: Boolean) {
-    val context = requireContext()
-    val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-    if (keepAwake) {
-      if (wakeLock == null || wakeLock!!.isHeld.not()) {
-        wakeLock = powerManager.newWakeLock(
-          PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
-          "CallEngine:WakeLock"
-        )
-        wakeLock?.acquire(10 * 60 * 1000L)
-        Log.d(TAG, "Acquired SCREEN_DIM_WAKE_LOCK")
-      }
-    } else {
-      wakeLock?.let {
-        if (it.isHeld) {
-          it.release()
-          Log.d(TAG, "Released SCREEN_DIM_WAKE_LOCK")
-        }
-      }
-      wakeLock = null
-    }
+      // This function is now superseded by setIdleTimerDisabled, which is called by CallManager.
+      // Retaining it here for backward compatibility if directly called, but internal logic
+      // is handled by updateOverallIdleTimerDisabledState based on manualIdleTimerDisabled and hasActiveCalls.
+      Log.w(TAG, "DEPRECATED: CallEngine.keepScreenAwake() is deprecated. Use setIdleTimerDisabled() via CallManager instead.")
+      CallEngine.setIdleTimerDisabled(keepAwake)
   }
 
   fun getActiveCalls(): List<CallInfo> = activeCalls.values.toList()
-  fun getCurrentCallId(): String? = currentCallId
   fun isCallActive(): Boolean = activeCalls.any {
     it.value.state == CallState.ACTIVE ||
     it.value.state == CallState.INCOMING ||
@@ -1154,21 +1291,29 @@ object CallEngine {
     val context = requireContext()
     Log.d(TAG, "Showing incoming call UI for $callId")
 
-    val useCallStyleNotification = supportsCallStyleNotifications()
+    val useCallStyleNotification = CallEngine.supportsCallStyleNotifications()
     Log.d(TAG, "Using CallStyle notification: $useCallStyleNotification")
 
     val isDeviceLocked = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
         val keyguardManager = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
         keyguardManager.isKeyguardLocked
     } else {
-        false
+        false // For API < 21, assume not locked or locking doesn't prevent activity launch
     }
 
-    if (isDeviceLocked || !useCallStyleNotification) {
-      Log.d(TAG, "Device is locked or CallStyle not supported/preferred - using overlay/fallback approach")
+    // Prioritize CallActivity overlay if permission is granted AND device is locked, OR if CallStyle is NOT supported.
+    // Otherwise, default to standard notification.
+    val hasOverlayPermission = CallEngine.checkOverlayPermissionGranted(context)
+
+    if (hasOverlayPermission && isDeviceLocked) {
+      Log.d(TAG, "Overlay permission granted and device is locked - attempting CallActivity overlay.")
       showCallActivityOverlay(context, callId, callerName, callType, callerPicUrl)
-    } else {
-      Log.d(TAG, "Device is unlocked and supports CallStyle - using enhanced notification")
+    } else if (hasOverlayPermission && !useCallStyleNotification) {
+      Log.d(TAG, "Overlay permission granted and CallStyle not supported - attempting CallActivity overlay.")
+      showCallActivityOverlay(context, callId, callerName, callType, callerPicUrl)
+    }
+    else {
+      Log.d(TAG, "Defaulting to standard notification (e.g., unlocked and CallStyle supported, or no overlay permission).")
       showStandardNotification(context, callId, callerName, callType, callerPicUrl)
     }
     playRingtone()
@@ -1186,27 +1331,21 @@ object CallEngine {
       putExtra("callerName", callerName)
       putExtra("callType", callType)
       callerPicUrl?.let { putExtra("callerAvatar", it) }
-      putExtra("LOCK_SCREEN_MODE", true)
-    }
-
-    // ONLY CHECK permission, DO NOT REQUEST HERE
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !checkOverlayPermissionGranted(context)) {
-        Log.w(TAG, "Cannot show CallActivity overlay without SYSTEM_ALERT_WINDOW permission. Falling back to standard notification.")
-        showStandardNotification(context, callId, callerName, callType, callerPicUrl)
-        return
+      putExtra("LOCK_SCREEN_MODE", true) // Indicate that this is a lock screen bypass attempt
     }
 
     try {
       val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+      @Suppress("DEPRECATION")
       val wakeLock = powerManager.newWakeLock(
         PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
         "CallEngine:LockScreenWake"
       )
-      wakeLock.acquire(5000)
+      wakeLock.acquire(5000) // Acquire for a short duration to ensure screen is on for activity launch
       context.startActivity(overlayIntent)
       Log.d(TAG, "Successfully launched CallActivity overlay")
     } catch (e: Exception) {
-      Log.e(TAG, "Overlay failed (after permission check), falling back to standard notification: ${e.message}")
+      Log.e(TAG, "Failed to launch CallActivity overlay: ${e.message}. Falling back to standard notification.", e)
       showStandardNotification(context, callId, callerName, callType, callerPicUrl)
     }
   }
@@ -1246,12 +1385,13 @@ object CallEngine {
       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
     )
 
-    val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && supportsCallStyleNotifications()) {
+    val notificationBuilder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && supportsCallStyleNotifications()) {
       val person = android.app.Person.Builder()
         .setName(callerName)
         .setImportant(true)
         .build()
-      Notification.Builder(context, NOTIF_CHANNEL_ID)
+
+      val builder = Notification.Builder(context, NOTIF_CHANNEL_ID)
         .setSmallIcon(android.R.drawable.sym_call_incoming)
         .setStyle(
           Notification.CallStyle.forIncomingCall(
@@ -1264,27 +1404,40 @@ object CallEngine {
         .setOngoing(true)
         .setAutoCancel(false)
         .setCategory(Notification.CATEGORY_CALL)
-        .setPriority(Notification.PRIORITY_MAX)
         .setVisibility(Notification.VISIBILITY_PUBLIC)
         .setSound(null)
-        .build()
+
+      // Apply deprecated methods with suppression
+      @Suppress("DEPRECATION")
+      builder.setPriority(Notification.PRIORITY_MAX)
+
+      builder
     } else {
-      Notification.Builder(context, NOTIF_CHANNEL_ID)
+      val builder = Notification.Builder(context, NOTIF_CHANNEL_ID)
         .setSmallIcon(android.R.drawable.sym_call_incoming)
         .setContentTitle("Incoming Call")
         .setContentText(callerName)
-        .setPriority(Notification.PRIORITY_MAX)
         .setCategory(Notification.CATEGORY_CALL)
         .setFullScreenIntent(fullScreenPendingIntent, true)
-        .addAction(android.R.drawable.sym_action_call, "Answer", answerPendingIntent)
-        .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Decline", declinePendingIntent)
         .setOngoing(true)
         .setAutoCancel(false)
         .setVisibility(Notification.VISIBILITY_PUBLIC)
         .setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE))
-        .build()
+
+      // Apply deprecated methods with suppression
+      @Suppress("DEPRECATION")
+      builder.setPriority(Notification.PRIORITY_MAX)
+
+      @Suppress("DEPRECATION")
+      builder.addAction(android.R.drawable.sym_action_call, "Answer", answerPendingIntent)
+
+      @Suppress("DEPRECATION")
+      builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Decline", declinePendingIntent)
+
+      builder
     }
 
+    val notification = notificationBuilder.build()
     notificationManager.notify(NOTIF_ID, notification)
   }
 
@@ -1293,12 +1446,12 @@ object CallEngine {
     val notificationManager =
       context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     notificationManager.cancel(NOTIF_ID)
-    stopRingtone()
+    CallEngine.stopRingtone()
   }
 
   private fun startForegroundService() {
     val context = requireContext()
-    val currentCall = activeCalls.values.find {
+    val currentCall = CallEngine.activeCalls.values.find {
       it.state == CallState.ACTIVE ||
       it.state == CallState.INCOMING ||
       it.state == CallState.DIALING ||
@@ -1330,43 +1483,19 @@ object CallEngine {
     startForegroundService()
   }
 
+  // Renamed to be explicit about what it checks
   private fun isMainActivityInForeground(): Boolean {
-    val context = requireContext()
-    val activityManager =
-      context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
-      try {
-        val tasks = activityManager.appTasks
-        if (tasks.isNotEmpty()) {
-          val topActivityComponentName = tasks[0].taskInfo.topActivity
-          return topActivityComponentName?.className?.contains("MainActivity") == true
-        }
-      } catch (e: Exception) {
-        Log.w(TAG, "Failed to get app tasks for foreground check: ${e.message}")
-      }
-    } else {
-      @Suppress("DEPRECATION")
-      try {
-        val tasks = activityManager.getRunningTasks(1)
-        if (tasks.isNotEmpty()) {
-          val runningTaskInfo = tasks[0]
-          return runningTaskInfo.topActivity?.className?.contains("MainActivity") == true
-        }
-      } catch (e: Exception) {
-        Log.w(TAG, "Failed to get running tasks for foreground check (deprecated): ${e.message}")
-      }
-    }
-    return false
+      return isMainActivityCurrentlyVisible
   }
 
   private fun bringAppToForeground() {
+    // Only attempt to bring MainActivity to foreground if it's NOT already visible.
     if (isMainActivityInForeground()) {
-      Log.d(TAG, "MainActivity is already in foreground, skipping")
-      return
+        Log.d(TAG, "MainActivity is already in foreground, skipping launch.")
+        return
     }
 
-    Log.d(TAG, "Bringing app to foreground")
+    Log.d(TAG, "Attempting to bring MainActivity to foreground.")
     val context = requireContext()
     val packageName = context.packageName
     val launchIntent = context.packageManager.getLaunchIntentForPackage(packageName)
@@ -1376,17 +1505,18 @@ object CallEngine {
       Intent.FLAG_ACTIVITY_SINGLE_TOP
     )
 
-    if (isCallActive()) {
+    if (CallEngine.isCallActive()) {
       launchIntent?.putExtra("BYPASS_LOCK_SCREEN", true)
     }
 
     try {
       context.startActivity(launchIntent)
-      Handler(Looper.getMainLooper()).postDelayed({
-        updateLockScreenBypass()
+      // Small delay to allow activity to start, then update bypass.
+      mainHandler.postDelayed({
+          CallEngine.updateLockScreenBypass()
       }, 100)
     } catch (e: Exception) {
-      Log.e(TAG, "Failed to bring app to foreground: ${e.message}")
+      Log.e(TAG, "Failed to launch MainActivity: ${e.message}")
     }
   }
 
@@ -1394,7 +1524,7 @@ object CallEngine {
     val context = requireContext()
     val telecomManager =
       context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-    val phoneAccountHandle = getPhoneAccountHandle()
+    val phoneAccountHandle = CallEngine.getPhoneAccountHandle()
 
     if (telecomManager.getPhoneAccount(phoneAccountHandle) == null) {
       val phoneAccount = PhoneAccount.builder(phoneAccountHandle, "PingMe Call")
@@ -1414,7 +1544,7 @@ object CallEngine {
     val context = requireContext()
     return PhoneAccountHandle(
       ComponentName(context, MyConnectionService::class.java),
-      PHONE_ACCOUNT_ID
+      CallEngine.PHONE_ACCOUNT_ID
     )
   }
 
@@ -1489,32 +1619,41 @@ object CallEngine {
   private fun cleanup() {
     Log.d(TAG, "Performing cleanup")
     stopForegroundService()
-    keepScreenAwake(false)
-    resetAudioMode()
+    CallEngine.updateOverallIdleTimerDisabledState()
+    CallEngine.resetAudioMode()
   }
 
   fun onApplicationTerminate() {
     Log.d(TAG, "Application terminating")
-    activeCalls.keys.toList().forEach { callId ->
-      telecomConnections[callId]?.let { conn ->
+    // Unregister lifecycle callbacks first to prevent further state changes during termination
+    (appContext as? Application)?.unregisterActivityLifecycleCallbacks(lifecycleCallbacks)
+
+    CallEngine.activeCalls.keys.toList().forEach { callId ->
+      CallEngine.telecomConnections[callId]?.let { conn ->
         conn.setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
         conn.destroy()
       }
     }
-    activeCalls.clear()
-    telecomConnections.clear()
-    callMetadata.clear()
-    callAnswerStates.clear()
-    currentCallId = null
-    cleanup()
-    lockScreenBypassCallbacks.clear()
-    eventHandler = null
-    cachedEvents.clear()
-    isInitialized.set(false)
-    appContext = null
-    currentActiveCallEndpoint = null
-    availableCallEndpoints = emptyList()
-    wasManuallySetAudioRoute = false
+    CallEngine.activeCalls.clear()
+    CallEngine.telecomConnections.clear()
+    CallEngine.callMetadata.clear()
+    CallEngine.callAnswerStates.clear()
+    CallEngine.currentCallId = null
+    CallEngine.cleanup()
+    CallEngine.lockScreenBypassCallbacks.clear()
+    CallEngine.eventHandler = null
+    CallEngine.cachedEvents.clear()
+    CallEngine.isInitialized.set(false)
+    CallEngine.appContext = null
+    CallEngine.currentActiveCallEndpoint = null
+    CallEngine.availableCallEndpoints = emptyList()
+    CallEngine.wasManuallySetAudioRoute = false
+    CallEngine.previousCallStateActive = false // Reset event state
+    CallEngine.manualIdleTimerDisabled = false // Reset manual screen awake state
+    // Reset foreground detection state
+    foregroundActivitiesCount = 0
+    isAppCurrentlyVisible = false
+    isMainActivityCurrentlyVisible = false
   }
 
   // --- Refactored SYSTEM_ALERT_WINDOW permission functions ---

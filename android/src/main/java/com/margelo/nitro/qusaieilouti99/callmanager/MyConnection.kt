@@ -96,7 +96,7 @@ class MyConnection(
     override fun onCallEndpointChanged(callEndpoint: android.telecom.CallEndpoint) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             super.onCallEndpointChanged(callEndpoint)
-            Log.d(TAG, "Telecom reported active CallEndpoint for callId: $callId: ${callEndpoint.endpointName} (type: ${callEndpoint.endpointType})")
+            Log.d(TAG, "Telecom reported active CallEndpoint for callId: $callId: ${callEndpoint.endpointName} (type: ${CallEngine.mapCallEndpointTypeToString(callEndpoint.endpointType)})")
             CallEngine.onTelecomAudioRouteChanged(callId, callEndpoint)
         }
     }
@@ -159,8 +159,11 @@ class MyConnection(
     // Method to set audio route through telecom using CallEndpoint API (API 34+)
     @Suppress("NewApi")
     fun setTelecomAudioRoute(endpoint: android.telecom.CallEndpoint) {
+        // This method should only be called on API 34+ from CallEngine.setModernAudioRoute.
+        // The `else` block was removed as it contained API 34+ type references that caused compilation issues
+        // on lower API levels, and it was dead code at runtime anyway.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            Log.d(TAG, "Requesting telecom audio route change to: ${endpoint.endpointName} (type: ${endpoint.endpointType}) for callId: $callId")
+            Log.d(TAG, "Requesting telecom audio route change to: ${endpoint.endpointName} (type: ${CallEngine.mapCallEndpointTypeToString(endpoint.endpointType)}) for callId: $callId")
             try {
                 // Use Context.getMainExecutor() for callback execution on the main thread
                 requestCallEndpointChange(endpoint, context.mainExecutor, object : android.os.OutcomeReceiver<Void?, android.telecom.CallEndpointException> {
@@ -177,14 +180,14 @@ class MyConnection(
             } catch (e: Exception) {
                 Log.e(TAG, "Error calling requestCallEndpointChange: ${e.message}", e)
             }
-        } else {
-            Log.w(TAG, "CallEndpoint API not available on this Android version. Using fallback audio routing.")
-            // Use legacy audio routing
-            CallEngine.setLegacyAudioRoute(endpoint)
         }
+        // No else block needed here; the audio routing logic for older APIs is handled
+        // directly by `CallEngine.setAudioRoute` calling `setLegacyAudioRouteDirect`.
+        // If this method is mistakenly called on API < 34, it will simply do nothing now, which is safe.
     }
 
-    // Fallback method for legacy audio routing (API 28-33)
+    // This method is now effectively a passthrough to setLegacyAudioRouteDirect in CallEngine
+    // when running on older Android versions. It's called when MyConnection determines to use legacy routing.
     fun setLegacyAudioRoute(route: String) {
         Log.d(TAG, "Setting legacy audio route: $route for callId: $callId")
         CallEngine.setLegacyAudioRouteDirect(route)
