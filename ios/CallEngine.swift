@@ -26,13 +26,13 @@ class CallEngine {
     // Track video calls that need speaker activation
     private var videoCallsNeedingSpeaker: Set<String> = []
 
-    // NEW: Track calls being answered via the startCall method
-    private var answeringIncomingViaStartCall: Set<String> = [] // NEW
+    // Track calls being answered via the startCall method
+    private var answeringIncomingViaStartCall: Set<String> = []
 
-    // NEW: State for CALL_STATE_CHANGED event
+    // State for CALL_STATE_CHANGED event
     private var previousCallStateActive: Bool = false
 
-    // NEW: Manual control for idle timer (screen awake)
+    // Manual control for idle timer (screen awake)
     private var manualIdleTimerDisabled: Bool = false
 
     private init() {
@@ -50,9 +50,10 @@ class CallEngine {
         VoIPTokenManager.shared.setupPushKit()
         isInitialized = true
         logger.info("CallEngine initialized")
-        // NEW: Emit initial call state
-        updateOverallIdleTimerDisabledState() // Initial screen awake state
-        emitCallStateChanged() // Initial call state event
+
+        // Emit initial call state
+        updateOverallIdleTimerDisabledState()
+        emitCallStateChanged()
     }
 
     func setCanMakeMultipleCalls(_ allow: Bool) {
@@ -120,8 +121,8 @@ class CallEngine {
                             state: .incoming)
         activeCalls[callId] = info
         currentCallId = callId
-        updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
-        emitCallStateChanged() // NEW: Emit call state changed event
+        updateOverallIdleTimerDisabledState()
+        emitCallStateChanged()
 
         callKitManager.reportIncomingCall(callInfo: info) { [weak self] error in
             guard let self = self else {
@@ -191,8 +192,8 @@ class CallEngine {
                             state: .dialing)
         activeCalls[callId] = info
         currentCallId = callId
-        updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
-        emitCallStateChanged() // NEW: Emit call state changed event
+        updateOverallIdleTimerDisabledState()
+        emitCallStateChanged()
 
         // Mark video calls for speaker activation
         if callType.lowercased().contains("video") {
@@ -218,7 +219,6 @@ class CallEngine {
     {
         logger.info("startCall (join ongoing): \(callId), type=\(callType)")
 
-        // --- MODIFICATION START ---
         // Check if the callId corresponds to an existing incoming call
         if let existingCallInfo = activeCalls[callId], existingCallInfo.state == .incoming {
             logger.info("startCall: Detected attempt to answer existing incoming call \(callId). Redirecting to answer flow.")
@@ -232,14 +232,11 @@ class CallEngine {
             // Mark this call as one being answered via startCall
             answeringIncomingViaStartCall.insert(callId)
 
-            // Trigger the CallKit answer action. This will lead to `callKitManager(_:didAnswerCall:)` being called.
+            // Trigger the CallKit answer action
             callKitManager.answerCall(callId: callId)
 
-            // Return early as we've redirected to the answer flow.
             return
         }
-        // --- MODIFICATION END ---
-
 
         if let m = metadata {
             callMetadata[callId] = m
@@ -273,8 +270,8 @@ class CallEngine {
                             state: .dialing)
         activeCalls[callId] = info
         currentCallId = callId
-        updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
-        emitCallStateChanged() // NEW: Emit call state changed event
+        updateOverallIdleTimerDisabledState()
+        emitCallStateChanged()
 
         // Mark video calls for speaker activation
         if callType.lowercased().contains("video") {
@@ -336,6 +333,7 @@ class CallEngine {
     }
 
     // MARK: Internal
+
     private func coreCallAnswered(callId: String, isLocalAnswer: Bool) {
         logger.info("📞 Core call answered: callId=\(callId), isLocalAnswer=\(isLocalAnswer)")
 
@@ -350,18 +348,20 @@ class CallEngine {
         self.currentCallId = callId
         logger.info("📞 Call state updated: \(previousState.stringValue) → \(CallState.active.stringValue)")
 
-        updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
-        emitCallStateChanged() // NEW: Emit call state changed event
+        updateOverallIdleTimerDisabledState()
+        emitCallStateChanged()
 
-        // Mark video calls for speaker activation on answer
+        // Handle video call speaker activation
         if callInfo.callType.lowercased().contains("video") {
-            logger.info("📞 Video call answered - marking for speaker activation")
+            logger.info("📞 Video call answered - scheduling speaker activation")
             videoCallsNeedingSpeaker.insert(callId)
-            // Set speaker after a delay to ensure audio session is stable
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+
+            // Set speaker after audio session is stable
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                 if self.videoCallsNeedingSpeaker.contains(callId) {
                     self.audioManager.setAudioRoute("Speaker", force: true)
                     self.videoCallsNeedingSpeaker.remove(callId)
+                    self.logger.info("📞 Video call speaker activated")
                 }
             }
         }
@@ -389,26 +389,18 @@ class CallEngine {
             currentCallId = activeCalls.values
                 .first(where: { $0.state != .ended })?.callId
         }
-        if activeCalls.isEmpty {
-            // Reset audio session to default after all calls end
-            let audioSession = AVAudioSession.sharedInstance()
-            do {
-                try audioSession.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-                try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-            } catch {
-                logger.error("Failed to reset audio session: \(error.localizedDescription)")
-            }
-        }
+
         callEndListeners.forEach { listener in
             DispatchQueue.main.async { listener(callId) }
         }
+
         var data: [String: Any] = ["callId": callId]
         if let m = callMetadata.removeValue(forKey: callId) {
             data["metadata"] = m
         }
         emitEvent(.callEnded, data: data)
-        updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
-        emitCallStateChanged() // NEW: Emit call state changed event
+        updateOverallIdleTimerDisabledState()
+        emitCallStateChanged()
     }
 
     // MARK: Audio
@@ -434,7 +426,7 @@ class CallEngine {
     private func emitEvent(_ type: CallEventType, data: [String: Any]) {
         logger.info("emitEvent: \(type.stringValue)")
         do {
-            let json = try JSONSerialization.data(withJSONObject: data, options: []) // Removed prettyPrinted for smaller payload
+            let json = try JSONSerialization.data(withJSONObject: data, options: [])
             let s = String(data: json, encoding: .utf8) ?? "{}"
             if let h = eventHandler {
                 h(type, s)
@@ -470,7 +462,7 @@ class CallEngine {
         emitEvent(.outgoingCallAnswered, data: data)
     }
 
-    // NEW: Emit CALL_STATE_CHANGED event
+    // Emit CALL_STATE_CHANGED event
     private func emitCallStateChanged() {
         let currentIsActive = hasActiveCalls()
         if currentIsActive != previousCallStateActive {
@@ -480,29 +472,22 @@ class CallEngine {
         }
     }
 
-    // Updated to check all relevant call states, not just active
     func hasActiveCalls() -> Bool {
-        logger.debug("hasActiveCalls check")
         let hasRelevantCalls = !activeCalls.isEmpty && activeCalls.values.contains { call in
-            // Include all states except ended - this covers incoming, dialing, active, held
             call.state != .ended
         }
         logger.debug("hasActiveCalls: \(hasRelevantCalls), total: \(self.activeCalls.count)")
-        let callStates = activeCalls.values.map { "\($0.callId): \($0.state.stringValue)" }
-        logger.debug("Call states: \(callStates)")
         return hasRelevantCalls
     }
 
     // MARK: Screen Awake Management
 
-    // NEW: Public method for JS to control screen awake
     func setIdleTimerDisabled(shouldDisable: Bool) {
         logger.info("setIdleTimerDisabled (JS requested): \(shouldDisable)")
         manualIdleTimerDisabled = shouldDisable
         updateOverallIdleTimerDisabledState()
     }
 
-    // NEW: Internal method to determine and set final idle timer state
     private func updateOverallIdleTimerDisabledState() {
         let shouldDisable = manualIdleTimerDisabled || hasActiveCalls()
         DispatchQueue.main.async {
@@ -510,7 +495,6 @@ class CallEngine {
             self.logger.info("Screen awake state updated. isIdleTimerDisabled = \(shouldDisable) (manual=\(self.manualIdleTimerDisabled), hasCalls=\(self.hasActiveCalls()))")
         }
     }
-
 
     // MARK: Helpers
 
@@ -523,16 +507,14 @@ class CallEngine {
 
 extension CallEngine: CallKitManagerDelegate {
     func callKitManager(_ manager: CallKitManager, didAnswerCall callId: String) {
-        // MODIFICATION START
         if answeringIncomingViaStartCall.contains(callId) {
             logger.info("📞 CallKit answered: \(callId). This was initiated by startCall, treating as non-local answer.")
             answeringIncomingViaStartCall.remove(callId)
-            coreCallAnswered(callId: callId, isLocalAnswer: false) // isLocalAnswer: false for OUTGOING_CALL_ANSWERED
+            coreCallAnswered(callId: callId, isLocalAnswer: false)
         } else {
             logger.info("📞 CallKit answered: \(callId). Standard local answer.")
-            coreCallAnswered(callId: callId, isLocalAnswer: true) // isLocalAnswer: true for CALL_ANSWERED
+            coreCallAnswered(callId: callId, isLocalAnswer: true)
         }
-        // MODIFICATION END
     }
 
     func callKitManager(_ manager: CallKitManager, didEndCall callId: String) {
@@ -554,8 +536,8 @@ extension CallEngine: CallKitManagerDelegate {
             emitEvent(.callUnheld, data: ["callId": callId])
         }
         activeCalls[callId] = info
-        updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
-        emitCallStateChanged() // NEW: Emit call state changed event
+        updateOverallIdleTimerDisabledState()
+        emitCallStateChanged()
     }
 
     func callKitManager(_ manager: CallKitManager, didSetMuted callId: String, muted: Bool) {
@@ -575,36 +557,27 @@ extension CallEngine: CallKitManagerDelegate {
 
             // Handle video calls needing speaker activation
             if videoCallsNeedingSpeaker.contains(callId) {
-                logger.info("📞 Video call connected - setting speaker after delay")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                logger.info("📞 Video call connected - scheduling speaker activation")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                     if self.videoCallsNeedingSpeaker.contains(callId) {
                         self.audioManager.setAudioRoute("Speaker", force: true)
                         self.videoCallsNeedingSpeaker.remove(callId)
+                        self.logger.info("📞 Video call speaker activated")
                     }
                 }
             }
 
             emitOutgoingCallAnsweredWithMetadata(callId: callId)
         }
-        updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
-        emitCallStateChanged() // NEW: Emit call state changed event
+        updateOverallIdleTimerDisabledState()
+        emitCallStateChanged()
     }
 
     func callKitManager(_ manager: CallKitManager, didActivateAudioSession session: AVAudioSession) {
         logger.info("CallKit didActivate audioSession")
         audioManager.callKitDidActivateAudioSession(session)
-
-        // Set speaker ONCE for video calls, after WebRTC is enabled and session is active
-        if let callId = currentCallId,
-           let info = activeCalls[callId],
-           info.callType.lowercased().contains("video")
-        {
-            logger.info("Setting speaker for video call \(callId) after activation")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                self.audioManager.setAudioRoute("Speaker", force: true)
-            }
-        }
     }
+
     func callKitManager(_ manager: CallKitManager, didDeactivateAudioSession session: AVAudioSession) {
         logger.info("CallKit didDeactivate audioSession")
         audioManager.callKitDidDeactivateAudioSession(session)

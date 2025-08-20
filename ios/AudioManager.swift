@@ -15,54 +15,97 @@ class AudioManager {
     private weak var delegate: AudioManagerDelegate?
     private let session = AVAudioSession.sharedInstance()
     private var observers: [NSObjectProtocol] = []
-    private var pendingRoute: String?
     private var isSessionActive: Bool = false
+
+    // Audio session configuration state
+    private var currentAudioConfiguration: RTCAudioSessionConfiguration?
+    private var preferredAudioRoute: String?
+    private var isManualAudioEnabled: Bool = true
+    private var audioActivationRetryCount: Int = 0
+    private let maxRetryCount: Int = 3
+
+    // Queue for audio session operations to ensure thread safety
+    private let audioQueue = DispatchQueue(label: "com.callmanager.audio", qos: .userInitiated)
 
     init(delegate: AudioManagerDelegate) {
         self.delegate = delegate
         logger.info("AudioManager init")
         setupNotifications()
-        setupInitialAudioSession()
         setupWebRTCAudio()
+        setupInitialAudioSession()
     }
 
     deinit {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
+        resetAudioSessionToDefault()
     }
+
+    // MARK: - Setup Methods
 
     private func setupNotifications() {
         let nc = NotificationCenter.default
+
         observers.append(
             nc.addObserver(
                 forName: AVAudioSession.routeChangeNotification,
                 object: nil,
                 queue: nil
-            ) { [weak self] n in self?.handleRouteChange(n) }
+            ) { [weak self] n in
+                self?.audioQueue.async {
+                    self?.handleRouteChange(n)
+                }
+            }
         )
+
         observers.append(
             nc.addObserver(
                 forName: AVAudioSession.interruptionNotification,
                 object: nil,
                 queue: nil
-            ) { [weak self] n in self?.handleInterruption(n) }
+            ) { [weak self] n in
+                self?.audioQueue.async {
+                    self?.handleInterruption(n)
+                }
+            }
         )
+
         observers.append(
             nc.addObserver(
                 forName: AVAudioSession.mediaServicesWereResetNotification,
                 object: nil,
                 queue: nil
-            ) { [weak self] _ in self?.handleMediaServicesReset() }
+            ) { [weak self] _ in
+                self?.audioQueue.async {
+                    self?.handleMediaServicesReset()
+                }
+            }
         )
+
+        observers.append(
+            nc.addObserver(
+                forName: AVAudioSession.silenceSecondaryAudioHintNotification,
+                object: nil,
+                queue: nil
+            ) { [weak self] n in
+                self?.audioQueue.async {
+                    self?.handleSilenceSecondaryAudioHint(n)
+                }
+            }
+        )
+
         logger.info("AudioManager notifications set")
     }
 
     private func setupInitialAudioSession() {
-        logger.info("Setting up initial audio session")
-        do {
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-            logger.info("Initial audio session configured")
-        } catch {
-            logger.error("Failed to setup initial audio session: \(error.localizedDescription)")
+        audioQueue.async {
+            self.logger.info("Setting up initial audio session")
+            do {
+                // Use a safe default category that won't interfere with other apps
+                try self.session.setCategory(.ambient, mode: .default, options: [])
+                self.logger.info("Initial audio session configured")
+            } catch {
+                self.logger.error("Failed to setup initial audio session: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -76,72 +119,102 @@ class AudioManager {
     // MARK: - CallKit Integration Points
 
     func callKitDidActivateAudioSession(_ audioSession: AVAudioSession) {
-        logger.info("CallKit didActivate audioSession, configuring for VoIP")
-        isSessionActive = true
+        audioQueue.async {
+            self.logger.info("CallKit didActivate audioSession, configuring for VoIP")
+            self.isSessionActive = true
+            self.audioActivationRetryCount = 0
 
-        // Configure WebRTC audio session (the right way)
-        let rtcAudioSession = RTCAudioSession.sharedInstance()
-        rtcAudioSession.lockForConfiguration()
-        let config = RTCAudioSessionConfiguration.webRTC()
-        config.categoryOptions = [
-            .allowBluetoothA2DP,
-            .duckOthers,
-            .allowBluetooth,
-            .mixWithOthers
-        ]
-        do {
-            try rtcAudioSession.setConfiguration(config)
-            try rtcAudioSession.setActive(true)
-        } catch {
-            logger.error("Failed to configure RTCAudioSession: \(error.localizedDescription)")
-        }
-        rtcAudioSession.isAudioEnabled = true
-        rtcAudioSession.unlockForConfiguration()
+            // Configure WebRTC audio session properly
+            let rtcAudioSession = RTCAudioSession.sharedInstance()
+            rtcAudioSession.lockForConfiguration()
 
-        delegate?.audioManagerDidActivateAudioSession(self)
+            do {
+                // First, notify WebRTC about the activation
+                rtcAudioSession.audioSessionDidActivate(audioSession)
 
-        // Handle pending route after proper activation
-        if let pending = pendingRoute {
-            logger.info("Setting pending audio route after activation: \(pending)")
-            pendingRoute = nil
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.setAudioRoute(pending, force: true)
+                // Configure for VoIP with proper settings
+                let config = RTCAudioSessionConfiguration.webRTC()
+                config.category = AVAudioSession.Category.playAndRecord.rawValue
+                config.mode = AVAudioSession.Mode.voiceChat.rawValue
+                config.categoryOptions = [
+                    .allowBluetooth,
+                    .allowBluetoothA2DP,
+                    .duckOthers
+                ]
+
+                try rtcAudioSession.setConfiguration(config)
+                self.currentAudioConfiguration = config
+
+                // Enable audio
+                rtcAudioSession.isAudioEnabled = true
+
+                self.logger.info("WebRTC audio session properly configured and activated")
+
+            } catch {
+                self.logger.error("Failed to configure RTCAudioSession: \(error.localizedDescription)")
             }
-        }
 
-        // Always notify about initial route after activation
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.notifyRouteChange()
+            rtcAudioSession.unlockForConfiguration()
+
+            // Notify delegate on main queue
+            DispatchQueue.main.async {
+                self.delegate?.audioManagerDidActivateAudioSession(self)
+            }
+
+            // Restore preferred audio route if set
+            if let preferredRoute = self.preferredAudioRoute {
+                self.logger.info("Restoring preferred audio route: \(preferredRoute)")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    self.setAudioRoute(preferredRoute, force: true)
+                }
+            }
+
+            // Always notify about route change after activation
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                self.notifyRouteChange()
+                self.notifyDevicesChanged()
+            }
         }
     }
 
     func callKitDidDeactivateAudioSession(_ audioSession: AVAudioSession) {
-        logger.info("CallKit didDeactivate audioSession, cleaning up")
-        isSessionActive = false
+        audioQueue.async {
+            self.logger.info("CallKit didDeactivate audioSession, cleaning up")
+            self.isSessionActive = false
 
-        let rtcAudioSession = RTCAudioSession.sharedInstance()
-        rtcAudioSession.lockForConfiguration()
-        rtcAudioSession.isAudioEnabled = false
-        rtcAudioSession.audioSessionDidDeactivate(audioSession)
-        rtcAudioSession.unlockForConfiguration()
+            let rtcAudioSession = RTCAudioSession.sharedInstance()
+            rtcAudioSession.lockForConfiguration()
 
-        // Reset to default audio configuration
-        do {
-            try audioSession.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-            try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-            logger.info("Audio session reset to default")
-        } catch {
-            logger.error("Failed to reset audio session: \(error.localizedDescription)")
+            // Disable audio first
+            rtcAudioSession.isAudioEnabled = false
+
+            // Notify WebRTC about deactivation
+            rtcAudioSession.audioSessionDidDeactivate(audioSession)
+
+            rtcAudioSession.unlockForConfiguration()
+
+            // Reset to default configuration
+            self.resetAudioSessionToDefault()
+
+            // Clear current configuration
+            self.currentAudioConfiguration = nil
+
+            // Notify delegate on main queue
+            DispatchQueue.main.async {
+                self.delegate?.audioManagerDidDeactivateAudioSession(self)
+            }
+
+            // Notify route change
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self.notifyRouteChange()
+                self.notifyDevicesChanged()
+            }
         }
-
-        delegate?.audioManagerDidDeactivateAudioSession(self)
-        notifyRouteChange()
     }
 
-    // MARK: - Audio Device Management
+    // MARK: - Audio Route Management
 
     func getAudioDevices() -> AudioRoutesInfo {
-        let current = session.currentRoute
         var devices = ["Earpiece", "Speaker"]
 
         if let inputs = session.availableInputs {
@@ -155,6 +228,10 @@ class AudioManager {
                     if !devices.contains("Headset") {
                         devices.append("Headset")
                     }
+                case .carAudio:
+                    if !devices.contains("CarAudio") {
+                        devices.append("CarAudio")
+                    }
                 default:
                     break
                 }
@@ -163,27 +240,43 @@ class AudioManager {
 
         let route = determineCurrentRoute()
         let deviceHolders = devices.map { StringHolder(value: $0) }
-        logger.info("getAudioDevices: route=\(route), devices=\(devices)")
+        logger.debug("getAudioDevices: route=\(route), devices=\(devices)")
         return AudioRoutesInfo(devices: deviceHolders, currentRoute: route)
     }
 
     func setAudioRoute(_ route: String, force: Bool = false) {
-        logger.info("setAudioRoute: \(route), isSessionActive=\(self.isSessionActive), force=\(force)")
+        audioQueue.async {
+            self.logger.info("setAudioRoute: \(route), isSessionActive=\(self.isSessionActive), force=\(force)")
 
-        if !isSessionActive && !force {
-            logger.info("Session not active, queueing route: \(route)")
-            pendingRoute = route
-            return
+            // Store user preference
+            self.preferredAudioRoute = route
+
+            // If session is not active and not forced, queue the route change
+            if !self.isSessionActive && !force {
+                self.logger.info("Session not active, storing preferred route: \(route)")
+                return
+            }
+
+            self.performRouteChange(route)
         }
+    }
 
-        pendingRoute = nil
-
+    private func performRouteChange(_ route: String) {
         do {
+            let rtcAudioSession = RTCAudioSession.sharedInstance()
+
+            rtcAudioSession.lockForConfiguration()
+
+            defer {
+                rtcAudioSession.unlockForConfiguration()
+            }
+
             switch route {
             case "Speaker":
                 try session.overrideOutputAudioPort(.speaker)
                 try session.setPreferredInput(nil)
                 logger.info("Audio route set to Speaker")
+
             case "Bluetooth":
                 if let bluetoothInput = session.availableInputs?.first(where: {
                     $0.portType == .bluetoothHFP || $0.portType == .bluetoothA2DP || $0.portType == .bluetoothLE
@@ -194,6 +287,7 @@ class AudioManager {
                     logger.warning("No Bluetooth input available")
                 }
                 try session.overrideOutputAudioPort(.none)
+
             case "Headset":
                 if let headsetInput = session.availableInputs?.first(where: {
                     $0.portType == .headphones || $0.portType == .headsetMic
@@ -204,18 +298,32 @@ class AudioManager {
                     logger.warning("No Headset input available")
                 }
                 try session.overrideOutputAudioPort(.none)
+
+            case "CarAudio":
+                if let carInput = session.availableInputs?.first(where: {
+                    $0.portType == .carAudio
+                }) {
+                    try session.setPreferredInput(carInput)
+                    logger.info("Audio route set to CarAudio: \(carInput.portName)")
+                } else {
+                    logger.warning("No CarAudio input available")
+                }
+                try session.overrideOutputAudioPort(.none)
+
             case "Earpiece":
                 try session.setPreferredInput(nil)
                 try session.overrideOutputAudioPort(.none)
                 logger.info("Audio route set to Earpiece")
+
             default:
                 try session.setPreferredInput(nil)
                 try session.overrideOutputAudioPort(.none)
-                logger.info("Audio route set to default")
+                logger.info("Audio route set to default (Earpiece)")
             }
 
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                self?.notifyRouteChange()
+            // Notify route change after a short delay
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                self.notifyRouteChange()
             }
 
         } catch {
@@ -237,6 +345,8 @@ class AudioManager {
                 return "Earpiece"
             case .headphones, .headsetMic:
                 return "Headset"
+            case .carAudio:
+                return "CarAudio"
             default:
                 continue
             }
@@ -244,27 +354,188 @@ class AudioManager {
         return "Earpiece"
     }
 
-    private func notifyRouteChange() {
-        let info = getAudioDevices()
-        logger.info("notifyRouteChange: currentRoute=\(info.currentRoute), devices=\(info.devices.map { $0.value })")
-        delegate?.audioManager(self, didChangeRoute: info)
+    // MARK: - Audio Session Recovery
+
+    private func recoverAudioSessionWithRetry() {
+        audioActivationRetryCount += 1
+
+        guard audioActivationRetryCount <= maxRetryCount else {
+            logger.error("Audio session recovery failed after \(self.maxRetryCount) attempts")
+            return
+        }
+
+        logger.info("Attempting audio session recovery (attempt \(self.audioActivationRetryCount)/\(self.maxRetryCount))")
+
+        let rtcAudioSession = RTCAudioSession.sharedInstance()
+        rtcAudioSession.lockForConfiguration()
+
+        do {
+            // Re-apply current configuration if available
+            if let config = currentAudioConfiguration {
+                try rtcAudioSession.setConfiguration(config)
+                rtcAudioSession.isAudioEnabled = true
+                logger.info("Audio session recovered successfully")
+
+                // Restore preferred route if set
+                if let preferredRoute = preferredAudioRoute {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        self.setAudioRoute(preferredRoute, force: true)
+                    }
+                }
+            }
+        } catch {
+            logger.error("Audio session recovery failed: \(error.localizedDescription)")
+
+            // Retry with exponential backoff
+            let delay = Double(audioActivationRetryCount) * 0.5
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                self.recoverAudioSessionWithRetry()
+            }
+        }
+
+        rtcAudioSession.unlockForConfiguration()
+    }
+
+    private func resetAudioSessionToDefault() {
+        do {
+            try session.setCategory(.ambient, mode: .default, options: [])
+            try session.setActive(false, options: .notifyOthersOnDeactivation)
+            logger.info("Audio session reset to default")
+        } catch {
+            logger.error("Failed to reset audio session: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Notification Handlers
 
     private func handleRouteChange(_ notification: Notification) {
-        logger.info("Audio route change notification")
-        notifyRouteChange()
+        guard let userInfo = notification.userInfo,
+              let reasonValue = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else {
+            return
+        }
+
+        logger.info("Audio route change: \(reason.rawValue)")
+
+        switch reason {
+        case .newDeviceAvailable, .oldDeviceUnavailable:
+            // Device change - update available devices and potentially recover session
+            notifyDevicesChanged()
+            notifyRouteChange()
+
+            // If we lost our preferred device, clear the preference
+            if reason == .oldDeviceUnavailable, let preferredRoute = preferredAudioRoute {
+                let currentDevices = getAudioDevices().devices.map { $0.value }
+                if !currentDevices.contains(preferredRoute) {
+                    logger.info("Preferred device \(preferredRoute) no longer available, clearing preference")
+                    self.preferredAudioRoute = nil
+                }
+            }
+
+        case .categoryChange:
+            // Category changed - might need to recover our configuration
+            if isSessionActive {
+                logger.warning("Audio session category changed during active call, attempting recovery")
+                recoverAudioSessionWithRetry()
+            }
+            notifyRouteChange()
+
+        case .override, .wakeFromSleep:
+            // These can affect routing, notify changes
+            notifyRouteChange()
+
+        default:
+            // Other route changes
+            notifyRouteChange()
+        }
     }
 
     private func handleInterruption(_ notification: Notification) {
-        logger.info("Audio interruption notification")
-        // Handle as needed
+        guard let userInfo = notification.userInfo,
+              let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue) else {
+            return
+        }
+
+        logger.info("Audio interruption: \(type.rawValue)")
+
+        switch type {
+        case .began:
+            logger.info("Audio interruption began")
+            // CallKit will handle the actual interruption, we just track state
+
+        case .ended:
+            if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
+                let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+                logger.info("Audio interruption ended with options: \(options.rawValue)")
+
+                if options.contains(.shouldResume) && isSessionActive {
+                    // Interruption ended and we should resume
+                    logger.info("Resuming audio session after interruption")
+
+                    // Give the system a moment to stabilize, then attempt recovery
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        self.audioQueue.async {
+                            self.recoverAudioSessionWithRetry()
+                        }
+                    }
+                }
+            }
+
+        @unknown default:
+            logger.warning("Unknown interruption type: \(type.rawValue)")
+        }
     }
 
     private func handleMediaServicesReset() {
         logger.warning("Media services were reset - reconfiguring audio")
+
+        // Reset WebRTC audio
         setupWebRTCAudio()
-        notifyRouteChange()
+
+        // If we had an active session, attempt to recover
+        if isSessionActive {
+            logger.info("Attempting to recover from media services reset")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                self.audioQueue.async {
+                    self.recoverAudioSessionWithRetry()
+                }
+            }
+        }
+
+        // Notify about changes
+        DispatchQueue.main.async {
+            self.notifyRouteChange()
+            self.notifyDevicesChanged()
+        }
+    }
+
+    private func handleSilenceSecondaryAudioHint(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let typeValue = userInfo[AVAudioSessionSilenceSecondaryAudioHintTypeKey] as? UInt,
+              let type = AVAudioSession.SilenceSecondaryAudioHintType(rawValue: typeValue) else {
+            return
+        }
+
+        logger.info("Secondary audio hint: \(type.rawValue)")
+        // This is informational - we don't need to take action as CallKit handles this
+    }
+
+    // MARK: - Notification Methods
+
+    private func notifyRouteChange() {
+        let info = getAudioDevices()
+        logger.debug("notifyRouteChange: currentRoute=\(info.currentRoute), devices=\(info.devices.map { $0.value })")
+        DispatchQueue.main.async {
+            self.delegate?.audioManager(self, didChangeRoute: info)
+        }
+    }
+
+    private func notifyDevicesChanged() {
+        let info = getAudioDevices()
+        logger.debug("notifyDevicesChanged: currentRoute=\(info.currentRoute), devices=\(info.devices.map { $0.value })")
+        DispatchQueue.main.async {
+            self.delegate?.audioManager(self, didChangeDevices: info)
+        }
     }
 }
