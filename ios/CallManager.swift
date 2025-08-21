@@ -3,6 +3,9 @@ import NitroModules
 import OSLog
 import UIKit
 
+/// The public-facing bridge class that implements the `HybridCallManagerSpec` protocol.
+/// Its responsibility is to translate calls from the JavaScript layer into commands
+/// for the `CallEngine` singleton. It acts as a thin, safe interface to the native call logic.
 public class CallManager: HybridCallManagerSpec {
     private let logger = Logger(
         subsystem: "com.qusaieilouti99.callmanager",
@@ -53,6 +56,7 @@ public class CallManager: HybridCallManagerSpec {
             self.logger.debug("🎯 event \(event.stringValue), payload.len=\(payload.count)")
             listener(event, payload)
         }
+        // Return a closure that will be called by the JS layer to unsubscribe.
         return {
             self.logger.info("🎯 removeListener ▶ js → native")
             CallEngine.shared.setEventHandler(nil)
@@ -150,10 +154,12 @@ public class CallManager: HybridCallManagerSpec {
     }
 
     public func requestOverlayPermissionAndroid() throws -> Bool {
+        // This is an Android-specific method, so we provide a no-op success case for iOS.
         return true
     }
 
     public func hasOverlayPermissionAndroid() throws -> Bool {
+        // This is an Android-specific method, so we provide a no-op success case for iOS.
         return true
     }
 }

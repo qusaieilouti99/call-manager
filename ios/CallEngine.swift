@@ -315,7 +315,13 @@ class CallEngine {
 
     private func updateOverallIdleTimerDisabledState() {
         let shouldDisable = manualIdleTimerDisabled || hasActiveCalls()
+
         DispatchQueue.main.async {
+            // Only modify UI if app is in foreground/active state
+            guard UIApplication.shared.applicationState == .active else {
+                self.logger.info("Skipping idle timer update - app not active")
+                return
+            }
             UIApplication.shared.isIdleTimerDisabled = shouldDisable
         }
     }
