@@ -247,4 +247,11 @@ class AudioManager {
             return "Earpiece"
         }
         switch output.portType {
-        case
+        case .bluetoothHFP, .bluetoothA2DP, .bluetoothLE: return "Bluetooth"
+        case .builtInSpeaker: return "Speaker"
+        case .builtInReceiver: return "Earpiece"
+        case .headphones, .headsetMic: return "Headset"
+        default: return "Earpiece"
+        }
+    }
+}
