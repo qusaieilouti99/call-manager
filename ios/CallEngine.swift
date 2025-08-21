@@ -5,426 +5,295 @@ import OSLog
 import WebRTC
 import UIKit
 
+/// The central controller for all call-related activities.
+/// This class manages call state, interacts with the `CallKitManager`,
+/// and commands the `AudioManager`. It is the "brain" of the native module.
 class CallEngine {
     static let shared = CallEngine()
 
-    private let logger = Logger(subsystem: "com.qusaieilouti99.callmanager", category: "CallManager")
+    private let logger = Logger(
+        subsystem: "com.qusaieilouti99.callmanager",
+        category: "CallEngine"
+    )
 
+    // MARK: - Private Properties
     private var callKitManager: CallKitManager!
     private var audioManager: AudioManager!
+
+    /// The source of truth for all calls, keyed by their lowercased UUID string.
     private var activeCalls: [String: CallInfo] = [:]
+    /// A separate dictionary to store metadata, as it can be large and is only needed for events.
     private var callMetadata: [String: String] = [:]
-    private var currentCallId: String?
-    private var canMakeMultipleCalls = false
+    /// Tracks calls that were answered via the `startCall` method to emit the correct event type.
+    private var answeringViaStartCall: Set<String> = []
 
     private var eventHandler: ((CallEventType, String) -> Void)?
     private var cachedEvents: [(CallEventType, String)] = []
-
-    private var callEndListeners: [(String) -> Void] = []
     private var isInitialized = false
-
-    // Track video calls that need speaker activation
-    private var videoCallsNeedingSpeaker: Set<String> = []
-
-    // Track calls being answered via the startCall method
-    private var answeringIncomingViaStartCall: Set<String> = []
-
-    // State for CALL_STATE_CHANGED event
-    private var previousCallStateActive: Bool = false
-
-    // Manual control for idle timer (screen awake)
     private var manualIdleTimerDisabled: Bool = false
 
     private init() {
-        logger.info("CallEngine singleton created")
+        logger.info("CallEngine singleton created.")
     }
+
+    // MARK: - Public Setup
 
     func initialize() {
         guard !isInitialized else {
-            logger.warning("CallEngine already initialized")
+            logger.warning("CallEngine already initialized. Ignoring.")
             return
         }
-        logger.info("Initializing CallEngine")
+        logger.info("Initializing CallEngine...")
         callKitManager = CallKitManager(delegate: self)
         audioManager = AudioManager(delegate: self)
         VoIPTokenManager.shared.setupPushKit()
         isInitialized = true
-        logger.info("CallEngine initialized")
-
-        // Emit initial call state
         updateOverallIdleTimerDisabledState()
-        emitCallStateChanged()
+        logger.info("✅ CallEngine initialized.")
     }
 
-    func setCanMakeMultipleCalls(_ allow: Bool) {
-        canMakeMultipleCalls = allow
-        logger.info("canMakeMultipleCalls = \(allow)")
-    }
+    // MARK: - Public JS Bridge Methods
 
-    func getCurrentCallState() -> String {
-        logger.debug("getCurrentCallState")
-        let array = activeCalls.values.map { $0.toJSONObject() }
-        do {
-            let data = try JSONSerialization.data(withJSONObject: array, options: .prettyPrinted)
-            let json = String(data: data, encoding: .utf8) ?? "[]"
-            return json
-        } catch {
-            logger.error("serialize state failed: \(error.localizedDescription)")
-            return "[]"
-        }
-    }
+    func reportIncomingCall(
+        callId: String,
+        callType: String,
+        displayName: String,
+        pictureUrl: String?,
+        metadata: String?,
+        completion: ((Bool) -> Void)?
+    ) {
+        let callId = callId.lowercased()
+        logger.info("JS -> reportIncomingCall: \(callId)")
 
-    // MARK: Incoming
-
-    func reportIncomingCall(callId: String,
-                            callType: String,
-                            displayName: String,
-                            pictureUrl: String? = nil,
-                            metadata: String? = nil,
-                            completion: ((Bool) -> Void)? = nil) {
-
-        logger.info("reportIncomingCall: \(callId), \(displayName)")
-
-        // Check for exact duplicate (same callId already exists)
-        if activeCalls[callId] != nil {
-            logger.warning("🔄 Duplicate call detected for \(callId) - ignoring")
+        guard activeCalls[callId] == nil else {
+            logger.warning("Ignoring duplicate incoming call for existing ID: \(callId)")
             completion?(true)
             return
         }
 
-        if let m = metadata {
-            callMetadata[callId] = m
-            logger.info("metadata cached for \(callId)")
-        }
+        if let m = metadata { callMetadata[callId] = m }
 
-        // Check validation but don't return early - always report to CallKit first
-        let hasIncomingCollision = activeCalls.values.contains { $0.state == .incoming }
-        let hasActiveConflict = !canMakeMultipleCalls &&
-                                activeCalls.values.contains { $0.state == .active || $0.state == .held }
-
-        let shouldEndImmediately = hasIncomingCollision || hasActiveConflict
-
-        if canMakeMultipleCalls {
-            activeCalls.values
-                .filter { $0.state == .active }
-                .forEach { call in
-                    logger.info("holding existing \(call.callId)")
-                    callKitManager.setCallOnHold(callId: call.callId, onHold: true)
-                }
-        }
-
-        // ALWAYS create and report to CallKit first
-        var info = CallInfo(callId: callId,
-                            callType: callType,
-                            displayName: displayName,
-                            pictureUrl: pictureUrl,
-                            state: .incoming)
+        let info = CallInfo(
+            callId: callId,
+            callType: callType,
+            displayName: displayName,
+            pictureUrl: pictureUrl,
+            state: .incoming)
         activeCalls[callId] = info
-        currentCallId = callId
-        updateOverallIdleTimerDisabledState()
         emitCallStateChanged()
 
         callKitManager.reportIncomingCall(callInfo: info) { [weak self] error in
-            guard let self = self else {
-                completion?(false)
-                return
+            let success = error == nil
+            if !success {
+                self?.endCallInternal(callId: callId)
             }
-
-            if let e = error {
-                self.logger.error("reportIncoming failed: \(e.localizedDescription)")
-                self.endCallInternal(callId: callId)
-                completion?(false)
-                return
-            }
-
-            self.logger.info("✅ CallKit successfully reported call \(callId)")
-            completion?(true)
-
-            // Handle validation after CallKit success
-            if shouldEndImmediately {
-                self.logger.info("🔄 Ending call \(callId) due to validation rules")
-
-                if hasIncomingCollision {
-                    self.emitEvent(.callRejected, data: ["callId": callId, "reason": "Another incoming exists"])
-                } else if hasActiveConflict {
-                    self.emitEvent(.callRejected, data: ["callId": callId, "reason": "Another call is active"])
-                }
-
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    self.callKitManager.endCall(callId: callId)
-                }
-            }
+            completion?(success)
         }
     }
 
-    // MARK: Outgoing
-
-    func startOutgoingCall(callId: String,
-                           callType: String,
-                           targetName: String,
-                           metadata: String? = nil)
-    {
-        logger.info("startOutgoingCall: \(callId), \(targetName)")
-        if let m = metadata {
-            callMetadata[callId] = m
-            logger.info("metadata cached for \(callId)")
-        }
-
-        guard validateOutgoingCallRequest() else {
-            logger.warning("rejecting outgoing \(callId) conflicts")
-            emitEvent(.callRejected, data: ["callId": callId, "reason": "Conflict with existing call"])
-            return
-        }
-
-        if canMakeMultipleCalls {
-            activeCalls.values
-                .filter { $0.state == .active }
-                .forEach { call in
-                    logger.info("holding existing \(call.callId)")
-                    callKitManager.setCallOnHold(callId: call.callId, onHold: true)
-                }
-        }
-
-        var info = CallInfo(callId: callId,
-                            callType: callType,
-                            displayName: targetName,
-                            pictureUrl: nil,
-                            state: .dialing)
-        activeCalls[callId] = info
-        currentCallId = callId
-        updateOverallIdleTimerDisabledState()
-        emitCallStateChanged()
-
-        // Mark video calls for speaker activation
-        if callType.lowercased().contains("video") {
-            logger.info("📞 Marking video outgoing call for speaker activation")
-            videoCallsNeedingSpeaker.insert(callId)
-        }
-
-        callKitManager.startOutgoingCall(callInfo: info) { error in
-            if let e = error {
-                self.logger.error("startOutgoing failed: \(e.localizedDescription)")
-                self.videoCallsNeedingSpeaker.remove(callId)
-                self.endCallInternal(callId: callId)
-            }
-        }
-    }
-
-    // MARK: Direct Active (Join Ongoing Call)
-
-    func startCall(callId: String,
-                   callType: String,
-                   targetName: String,
-                   metadata: String? = nil)
-    {
-        logger.info("startCall (join ongoing): \(callId), type=\(callType)")
-
-        // Check if the callId corresponds to an existing incoming call
-        if let existingCallInfo = activeCalls[callId], existingCallInfo.state == .incoming {
-            logger.info("startCall: Detected attempt to answer existing incoming call \(callId). Redirecting to answer flow.")
-
-            // Update metadata for the existing incoming call if provided
-            if let m = metadata {
-                callMetadata[callId] = m
-                logger.info("metadata updated for incoming call \(callId)")
-            }
-
-            // Mark this call as one being answered via startCall
-            answeringIncomingViaStartCall.insert(callId)
-
-            // Trigger the CallKit answer action
-            callKitManager.answerCall(callId: callId)
-
-            return
-        }
-
-        if let m = metadata {
-            callMetadata[callId] = m
-            logger.info("metadata cached for \(callId)")
-        }
+    func startOutgoingCall(
+        callId: String,
+        callType: String,
+        targetName: String,
+        metadata: String?
+    ) {
+        let callId = callId.lowercased()
+        logger.info("JS -> startOutgoingCall: \(callId)")
 
         guard activeCalls[callId] == nil else {
-            logger.warning("call \(callId) already exists")
+            logger.warning("Ignoring duplicate outgoing call for existing ID: \(callId)")
             return
         }
 
-        guard validateOutgoingCallRequest() else {
-            logger.warning("rejecting join call \(callId) - conflicts")
-            emitEvent(.callRejected, data: ["callId": callId, "reason": "Conflict with existing call"])
-            return
-        }
+        if let m = metadata { callMetadata[callId] = m }
 
-        if canMakeMultipleCalls {
-            activeCalls.values
-                .filter { $0.state == .active }
-                .forEach { call in
-                    logger.info("holding existing \(call.callId)")
-                    callKitManager.setCallOnHold(callId: call.callId, onHold: true)
-                }
-        }
-
-        var info = CallInfo(callId: callId,
-                            callType: callType,
-                            displayName: targetName,
-                            pictureUrl: nil,
-                            state: .dialing)
+        let info = CallInfo(
+            callId: callId,
+            callType: callType,
+            displayName: targetName,
+            pictureUrl: nil,
+            state: .dialing)
         activeCalls[callId] = info
-        currentCallId = callId
-        updateOverallIdleTimerDisabledState()
         emitCallStateChanged()
 
-        // Mark video calls for speaker activation
-        if callType.lowercased().contains("video") {
-            logger.info("📞 Marking video startCall for speaker activation")
-            videoCallsNeedingSpeaker.insert(callId)
-        }
-
         callKitManager.startOutgoingCall(callInfo: info) { [weak self] error in
-            if let e = error {
-                self?.logger.error("startCall failed: \(e.localizedDescription)")
-                self?.videoCallsNeedingSpeaker.remove(callId)
+            if error != nil {
                 self?.endCallInternal(callId: callId)
-                return
             }
+        }
+    }
 
-            // For startCall (join ongoing), report connected immediately
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                if let uuid = UUID(uuidString: callId) {
-                    self?.callKitManager.provider.reportOutgoingCall(with: uuid, connectedAt: Date())
-                    self?.logger.info("startCall: reported as connected immediately")
+    /// This special function either answers an existing incoming call (emitting `OUTGOING_CALL_ANSWERED`)
+    /// or starts a new call and immediately connects it for a "join call" experience.
+    func startCall(
+        callId: String,
+        callType: String,
+        targetName: String,
+        metadata: String?
+    ) {
+        let callId = callId.lowercased()
+        logger.info("JS -> startCall: \(callId)")
+
+        if let existingCall = activeCalls[callId], existingCall.state == .incoming {
+            logger.info("startCall: Answering existing incoming call \(callId).")
+            answeringViaStartCall.insert(callId)
+            callKitManager.answerCall(callId: callId)
+        } else {
+            logger.info("startCall: Starting and immediately connecting new call \(callId).")
+            if let m = metadata { callMetadata[callId] = m }
+
+            let info = CallInfo(
+                callId: callId,
+                callType: callType,
+                displayName: targetName,
+                pictureUrl: nil,
+                state: .dialing)
+            activeCalls[callId] = info
+            emitCallStateChanged()
+
+            callKitManager.startOutgoingCall(callInfo: info) { [weak self] error in
+                if let e = error {
+                    self?.logger.error("startCall failed to start call: \(e.localizedDescription)")
+                    self?.endCallInternal(callId: callId)
+                } else {
+                    // Immediately report as connected for the "join" experience.
+                    self?.callKitManager.reportOutgoingCallConnected(callId: callId)
                 }
             }
         }
     }
 
-    // MARK: JS Actions
-
-    func answerCall(callId: String) {
-        logger.info("answerCall (JS): \(callId)")
-        callKitManager.answerCall(callId: callId)
-    }
-
-    func setOnHold(callId: String, onHold: Bool) {
-        logger.info("setOnHold (JS): \(callId), onHold=\(onHold)")
-        callKitManager.setCallOnHold(callId: callId, onHold: onHold)
-    }
-
-    func setMuted(callId: String, muted: Bool) {
-        logger.info("setMuted (JS): \(callId), muted=\(muted)")
-        callKitManager.setMuted(callId: callId, muted: muted)
+    /// Called from JS (via the `callAnswered` bridge) to tell CallKit that the remote user has answered the call.
+    func connectOutgoingCall(callId: String) {
+        let callId = callId.lowercased()
+        logger.info("JS -> connectOutgoingCall: \(callId)")
+        guard let call = activeCalls[callId], call.state == .connecting else {
+            logger
+                .warning(
+                    "Cannot connect outgoing call, call not found or not in connecting state: \(callId)"
+                )
+            return
+        }
+        callKitManager.reportOutgoingCallConnected(callId: callId)
     }
 
     func endCall(callId: String) {
-        logger.info("endCall (JS): \(callId)")
-        videoCallsNeedingSpeaker.remove(callId)
+        let callId = callId.lowercased()
+        logger.info("JS -> endCall: \(callId)")
+        guard activeCalls[callId] != nil else { return }
         callKitManager.endCall(callId: callId)
     }
 
     func endAllCalls() {
-        logger.info("endAllCalls (JS)")
-        videoCallsNeedingSpeaker.removeAll()
-        activeCalls.keys.forEach { endCall(callId: $0) }
+        logger.info("JS -> endAllCalls")
+        activeCalls.keys.forEach { callKitManager.endCall(callId: $0) }
+    }
+
+    func setOnHold(callId: String, onHold: Bool) {
+        let callId = callId.lowercased()
+        logger.info("JS -> setOnHold: \(callId) to \(onHold)")
+        guard activeCalls[callId] != nil else { return }
+        callKitManager.setCallOnHold(callId: callId, onHold: onHold)
+    }
+
+    func setMuted(callId: String, muted: Bool) {
+        let callId = callId.lowercased()
+        logger.info("JS -> setMuted: \(callId) to \(muted)")
+        guard var info = activeCalls[callId] else { return }
+        info.isMuted = muted
+        activeCalls[callId] = info
+        callKitManager.setMuted(callId: callId, muted: muted)
     }
 
     func updateDisplayCallInformation(callId: String, callerName: String) {
-        logger.info("updateDisplayCallInformation: \(callId), \(callerName)")
+        let callId = callId.lowercased()
+        logger.info("JS -> updateDisplay: \(callId)")
         guard activeCalls[callId] != nil else { return }
         callKitManager.updateCall(callId: callId, displayName: callerName)
     }
 
-    // MARK: Internal
-
-    private func coreCallAnswered(callId: String, isLocalAnswer: Bool) {
-        logger.info("📞 Core call answered: callId=\(callId), isLocalAnswer=\(isLocalAnswer)")
-
-        guard var callInfo = self.activeCalls[callId] else {
-            logger.warning("📞 ⚠️ Cannot answer call \(callId) – not found in activeCalls")
-            return
-        }
-
-        let previousState = callInfo.state
-        callInfo.updateState(.active)
-        self.activeCalls[callId] = callInfo
-        self.currentCallId = callId
-        logger.info("📞 Call state updated: \(previousState.stringValue) → \(CallState.active.stringValue)")
-
-        updateOverallIdleTimerDisabledState()
-        emitCallStateChanged()
-
-        // Handle video call speaker activation
-        if callInfo.callType.lowercased().contains("video") {
-            logger.info("📞 Video call answered - scheduling speaker activation")
-            videoCallsNeedingSpeaker.insert(callId)
-
-            // Set speaker after audio session is stable
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                if self.videoCallsNeedingSpeaker.contains(callId) {
-                    self.audioManager.setAudioRoute("Speaker", force: true)
-                    self.videoCallsNeedingSpeaker.remove(callId)
-                    self.logger.info("📞 Video call speaker activated")
-                }
-            }
-        }
-
-        if isLocalAnswer {
-            if previousState == .incoming {
-                logger.info("📞 Emitting CALL_ANSWERED for incoming call \(callId)")
-                emitCallAnsweredWithMetadata(callId: callId)
-            } else {
-                logger.info("📞 Skipping CALL_ANSWERED for non‐incoming call \(callId)")
-            }
-        } else {
-            logger.info("📞 Emitting OUTGOING_CALL_ANSWERED for call \(callId)")
-            emitOutgoingCallAnsweredWithMetadata(callId: callId)
-        }
-    }
-
-    private func endCallInternal(callId: String) {
-        logger.info("endCallInternal: \(callId)")
-        videoCallsNeedingSpeaker.remove(callId)
-        guard var info = activeCalls[callId] else { return }
-        info.updateState(.ended)
-        activeCalls.removeValue(forKey: callId)
-        if currentCallId == callId {
-            currentCallId = activeCalls.values
-                .first(where: { $0.state != .ended })?.callId
-        }
-
-        callEndListeners.forEach { listener in
-            DispatchQueue.main.async { listener(callId) }
-        }
-
-        var data: [String: Any] = ["callId": callId]
-        if let m = callMetadata.removeValue(forKey: callId) {
-            data["metadata"] = m
-        }
-        emitEvent(.callEnded, data: data)
-        updateOverallIdleTimerDisabledState()
-        emitCallStateChanged()
-    }
-
-    // MARK: Audio
-
     func getAudioDevices() -> AudioRoutesInfo {
-        audioManager.getAudioDevices()
+        return audioManager.getAudioDevices()
     }
 
     func setAudioRoute(route: String) {
+        logger.info("JS -> setAudioRoute: \(route)")
         audioManager.setAudioRoute(route)
     }
 
-    // MARK: Eventing
-
     func setEventHandler(_ handler: ((CallEventType, String) -> Void)?) {
         eventHandler = handler
-        if let h = handler {
+        if let h = handler, !cachedEvents.isEmpty {
+            logger.info("Sending \(self.cachedEvents.count) cached events to new JS listener.")
             cachedEvents.forEach { h($0.0, $0.1) }
             cachedEvents.removeAll()
         }
     }
 
+    func hasActiveCalls() -> Bool {
+        return !activeCalls.isEmpty
+    }
+
+    func setIdleTimerDisabled(shouldDisable: Bool) {
+        logger.info("JS -> setIdleTimerDisabled: \(shouldDisable)")
+        manualIdleTimerDisabled = shouldDisable
+        updateOverallIdleTimerDisabledState()
+    }
+
+    // MARK: - Call State Management
+
+    /// Centralized logic for when a call becomes fully active (answered or connected).
+    private func callDidBecomeActive(callId: String) {
+        guard var callInfo = activeCalls[callId] else { return }
+
+        // Activate the audio session only if this is the first call to become active.
+        let otherCallsWereActive = activeCalls.values.contains {
+            $0.callId != callId && $0.state == .active
+        }
+        if !otherCallsWereActive {
+            let isVideo = callInfo.callType.lowercased().contains("video")
+            audioManager.activate(isVideo: isVideo)
+        }
+
+        callInfo.updateState(.active)
+        activeCalls[callId] = callInfo
+        emitCallStateChanged()
+    }
+
+    /// Centralized cleanup logic for any call that ends.
+    private func endCallInternal(callId: String) {
+        logger.info("Ending call internally: \(callId)")
+
+        // For the CALL_ENDED event, JS only expects the callId.
+        let payload = ["callId": callId]
+
+        guard activeCalls.removeValue(forKey: callId) != nil else { return }
+        callMetadata.removeValue(forKey: callId)
+
+        // If this was the last active call, deactivate the audio session.
+        if !hasActiveCalls() {
+            audioManager.deactivate()
+        }
+
+        emitEvent(.callEnded, data: payload)
+        emitCallStateChanged()
+    }
+
+    // MARK: - Event Emission
+
+    /// Emits an event with a rich payload containing the full CallInfo and metadata.
+    private func emitRichEvent(for callId: String, type: CallEventType) {
+        guard let info = activeCalls[callId] else { return }
+        var payload = info.toJSONObject()
+        if let metadata = callMetadata[callId] {
+            payload["metadata"] = metadata
+        }
+        emitEvent(type, data: payload)
+    }
+
+    /// Emits an event with a specific data payload.
     private func emitEvent(_ type: CallEventType, data: [String: Any]) {
-        logger.info("emitEvent: \(type.stringValue)")
+        logger.info("Emitting event: \(type.stringValue)")
         do {
             let json = try JSONSerialization.data(withJSONObject: data, options: [])
             let s = String(data: json, encoding: .utf8) ?? "{}"
@@ -434,57 +303,13 @@ class CallEngine {
                 cachedEvents.append((type, s))
             }
         } catch {
-            logger.error("serialize event failed: \(error.localizedDescription)")
+            logger.error("Failed to serialize event payload: \(error.localizedDescription)")
         }
     }
 
-    private func emitCallAnsweredWithMetadata(callId: String) {
-        guard let info = activeCalls[callId] else { return }
-        var data: [String: Any] = [
-            "callId": info.callId,
-            "callType": info.callType,
-            "displayName": info.displayName
-        ]
-        if let pic = info.pictureUrl { data["pictureUrl"] = pic }
-        if let m = callMetadata[callId] { data["metadata"] = m }
-        emitEvent(.callAnswered, data: data)
-    }
-
-    private func emitOutgoingCallAnsweredWithMetadata(callId: String) {
-        guard let info = activeCalls[callId] else { return }
-        var data: [String: Any] = [
-            "callId": info.callId,
-            "callType": info.callType,
-            "displayName": info.displayName
-        ]
-        if let pic = info.pictureUrl { data["pictureUrl"] = pic }
-        if let m = callMetadata[callId] { data["metadata"] = m }
-        emitEvent(.outgoingCallAnswered, data: data)
-    }
-
-    // Emit CALL_STATE_CHANGED event
     private func emitCallStateChanged() {
-        let currentIsActive = hasActiveCalls()
-        if currentIsActive != previousCallStateActive {
-            logger.info("📞 CALL_STATE_CHANGED: isActive=\(currentIsActive)")
-            emitEvent(.callStateChanged, data: ["isActive": currentIsActive])
-            previousCallStateActive = currentIsActive
-        }
-    }
-
-    func hasActiveCalls() -> Bool {
-        let hasRelevantCalls = !activeCalls.isEmpty && activeCalls.values.contains { call in
-            call.state != .ended
-        }
-        logger.debug("hasActiveCalls: \(hasRelevantCalls), total: \(self.activeCalls.count)")
-        return hasRelevantCalls
-    }
-
-    // MARK: Screen Awake Management
-
-    func setIdleTimerDisabled(shouldDisable: Bool) {
-        logger.info("setIdleTimerDisabled (JS requested): \(shouldDisable)")
-        manualIdleTimerDisabled = shouldDisable
+        let isActive = hasActiveCalls()
+        emitEvent(.callStateChanged, data: ["isActive": isActive])
         updateOverallIdleTimerDisabledState()
     }
 
@@ -492,29 +317,45 @@ class CallEngine {
         let shouldDisable = manualIdleTimerDisabled || hasActiveCalls()
         DispatchQueue.main.async {
             UIApplication.shared.isIdleTimerDisabled = shouldDisable
-            self.logger.info("Screen awake state updated. isIdleTimerDisabled = \(shouldDisable) (manual=\(self.manualIdleTimerDisabled), hasCalls=\(self.hasActiveCalls()))")
         }
-    }
-
-    // MARK: Helpers
-
-    private func validateOutgoingCallRequest() -> Bool {
-        !activeCalls.values.contains { $0.state == .incoming || (!canMakeMultipleCalls && ($0.state == .active || $0.state == .held)) }
     }
 }
 
-// MARK: CallKitManagerDelegate
+// MARK: - CallKitManagerDelegate
 
 extension CallEngine: CallKitManagerDelegate {
     func callKitManager(_ manager: CallKitManager, didAnswerCall callId: String) {
-        if answeringIncomingViaStartCall.contains(callId) {
-            logger.info("📞 CallKit answered: \(callId). This was initiated by startCall, treating as non-local answer.")
-            answeringIncomingViaStartCall.remove(callId)
-            coreCallAnswered(callId: callId, isLocalAnswer: false)
+        callDidBecomeActive(callId: callId)
+
+        // For a standard answer, the payload is just the pre-parsed metadata object.
+        var payload: [String: Any] = [:]
+        if let metadataString = callMetadata[callId],
+            let data = metadataString.data(using: .utf8),
+            let metadataObject = try? JSONSerialization.jsonObject(with: data, options: [])
+        {
+            payload["metadata"] = metadataObject
         } else {
-            logger.info("📞 CallKit answered: \(callId). Standard local answer.")
-            coreCallAnswered(callId: callId, isLocalAnswer: true)
+            payload["metadata"] = [:] // Send empty object if parsing fails
         }
+
+        // If the answer was triggered by `startCall`, emit OUTGOING_CALL_ANSWERED with a full payload.
+        if answeringViaStartCall.remove(callId) != nil {
+            emitRichEvent(for: callId, type: .outgoingCallAnswered)
+        } else {
+            emitEvent(.callAnswered, data: payload)
+        }
+    }
+
+    func callKitManager(_ manager: CallKitManager, didStartOutgoingCall callId: String) {
+        guard var info = activeCalls[callId] else { return }
+
+        // The audio session must be activated as soon as CallKit confirms the outgoing call has started.
+        let isVideo = info.callType.lowercased().contains("video")
+        audioManager.activate(isVideo: isVideo)
+
+        info.updateState(.connecting)
+        activeCalls[callId] = info
+        manager.reportOutgoingCallStartedConnecting(callId: callId)
     }
 
     func callKitManager(_ manager: CallKitManager, didEndCall callId: String) {
@@ -522,86 +363,54 @@ extension CallEngine: CallKitManagerDelegate {
     }
 
     func callKitManager(_ manager: CallKitManager, didSetHeld callId: String, onHold: Bool) {
-        logger.info("didSetHeld: \(callId), onHold=\(onHold)")
         guard var info = activeCalls[callId] else { return }
-
-        if onHold {
-            info.updateState(.held)
-            info.wasHeldBySystem = true
-            emitEvent(.callHeld, data: ["callId": callId])
-        } else {
-            info.updateState(.active)
-            info.wasHeldBySystem = false
-            currentCallId = callId
-            emitEvent(.callUnheld, data: ["callId": callId])
-        }
+        info.updateState(onHold ? .held : .active)
         activeCalls[callId] = info
-        updateOverallIdleTimerDisabledState()
+        // These events only require the callId.
+        emitEvent(onHold ? .callHeld : .callUnheld, data: ["callId": callId])
         emitCallStateChanged()
     }
 
     func callKitManager(_ manager: CallKitManager, didSetMuted callId: String, muted: Bool) {
-        logger.info("didSetMuted: \(callId), muted=\(muted)")
         guard var info = activeCalls[callId] else { return }
-        info.isManuallySilenced = muted
+        info.isMuted = muted
         activeCalls[callId] = info
-        let ev: CallEventType = muted ? .callMuted : .callUnmuted
-        emitEvent(ev, data: ["callId": callId])
+        // These events only require the callId.
+        emitEvent(muted ? .callMuted : .callUnmuted, data: ["callId": callId])
     }
 
-    func callKitManager(_ manager: CallKitManager, didStartOutgoingCall callId: String) {
-        logger.info("didStartOutgoingCall: \(callId)")
-        if var info = activeCalls[callId], info.state == .dialing {
-            info.updateState(.active)
-            activeCalls[callId] = info
-
-            // Handle video calls needing speaker activation
-            if videoCallsNeedingSpeaker.contains(callId) {
-                logger.info("📞 Video call connected - scheduling speaker activation")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    if self.videoCallsNeedingSpeaker.contains(callId) {
-                        self.audioManager.setAudioRoute("Speaker", force: true)
-                        self.videoCallsNeedingSpeaker.remove(callId)
-                        self.logger.info("📞 Video call speaker activated")
-                    }
-                }
-            }
-
-            emitOutgoingCallAnsweredWithMetadata(callId: callId)
-        }
-        updateOverallIdleTimerDisabledState()
-        emitCallStateChanged()
+    func callKitManagerDidReset(_ manager: CallKitManager) {
+        logger.error("CallKit Did Reset. Ending all calls and deactivating audio.")
+        audioManager.deactivate()
+        activeCalls.keys.forEach { endCallInternal(callId: $0) }
     }
 
     func callKitManager(_ manager: CallKitManager, didActivateAudioSession session: AVAudioSession) {
-        logger.info("CallKit didActivate audioSession")
-        audioManager.callKitDidActivateAudioSession(session)
+        audioManager.callKitDidActivateAudioSession()
     }
 
-    func callKitManager(_ manager: CallKitManager, didDeactivateAudioSession session: AVAudioSession) {
-        logger.info("CallKit didDeactivate audioSession")
-        audioManager.callKitDidDeactivateAudioSession(session)
+    func callKitManager(
+        _ manager: CallKitManager,
+        didDeactivateAudioSession session: AVAudioSession
+    ) {
+        logger.info("System confirmed audio session deactivation.")
     }
 }
 
-// MARK: AudioManagerDelegate
+// MARK: - AudioManagerDelegate
 
 extension CallEngine: AudioManagerDelegate {
     func audioManager(_ manager: AudioManager, didChangeRoute routeInfo: AudioRoutesInfo) {
         let deviceStrings = routeInfo.devices.map { $0.value }
-        emitEvent(.audioRouteChanged, data: ["devices": deviceStrings, "currentRoute": routeInfo.currentRoute])
+        emitEvent(
+            .audioRouteChanged,
+            data: ["devices": deviceStrings, "currentRoute": routeInfo.currentRoute])
     }
 
     func audioManager(_ manager: AudioManager, didChangeDevices routeInfo: AudioRoutesInfo) {
         let deviceStrings = routeInfo.devices.map { $0.value }
-        emitEvent(.audioDevicesChanged, data: ["devices": deviceStrings, "currentRoute": routeInfo.currentRoute])
-    }
-
-    func audioManagerDidActivateAudioSession(_ manager: AudioManager) {
-        logger.info("AudioManager did activate audio session")
-    }
-
-    func audioManagerDidDeactivateAudioSession(_ manager: AudioManager) {
-        logger.info("AudioManager did deactivate audio session")
+        emitEvent(
+            .audioDevicesChanged,
+            data: ["devices": deviceStrings, "currentRoute": routeInfo.currentRoute])
     }
 }
