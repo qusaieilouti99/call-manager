@@ -91,45 +91,81 @@ class VoIPTokenManager: NSObject, PKPushRegistryDelegate {
         // Initialize if not already initialized
         CallEngine.shared.initialize()
 
-        // *** THIS IS THE WATCHDOG TIMER ***
-        // It creates a failsafe that will call the completion handler after 10 seconds
-        // if our main logic hangs or fails silently, preventing the OS from killing the app.
+        // *** WATCHDOG TIMER ***
         let completionTimeout = DispatchWorkItem {
             self.logger.error("⚠️ VoIP push handling timed out. Forcing completion.")
             completion()
         }
-
         DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: completionTimeout)
 
-        // The payload is expected to have a specific structure.
-        // Using a key like "custom_payload" or "data" is common.
-        guard let info = payload.dictionaryPayload["custom_payload"] as? [AnyHashable: Any] else {
-            logger.error("❌ Invalid payload format or missing 'custom_payload' dictionary.")
-            completionTimeout.cancel() // Defuse the timer
+        // *** USE YOUR OLD FLEXIBLE PAYLOAD PARSING LOGIC ***
+        let full = payload.dictionaryPayload
+        logger.info("🔔 VoIP push – full payload keys: \(full.keys)")
+
+        var userInfo: [AnyHashable: Any]?
+
+        // Check for aps["data"] as JSON string first
+        if let aps = full["aps"] as? [AnyHashable: Any],
+           let dataString = aps["data"] as? String,
+           let data = dataString.data(using: .utf8) {
+            logger.info("🔍 found aps[\"data\"] string (length=\(dataString.count))")
+            do {
+                let obj = try JSONSerialization.jsonObject(with: data, options: [])
+                if let nestedDict = obj as? [AnyHashable: Any] {
+                    let keyList = nestedDict.keys.map { "\($0)" }
+                    logger.info("🔍 parsed nested payload keys: \(keyList)")
+                    userInfo = nestedDict
+                } else {
+                    logger.error("❌ parsed aps[\"data\"] but it's not a dictionary")
+                }
+            } catch {
+                logger.error("❌ failed to JSON-parse aps[\"data\"]: \(error.localizedDescription)")
+            }
+        }
+
+        // Fallback to top-level "data" dictionary
+        if userInfo == nil, let topData = full["data"] as? [AnyHashable: Any] {
+            logger.info("🔍 found top-level \"data\" dictionary – keys: \(topData.keys)")
+            userInfo = topData
+        }
+
+        // Fallback to top-level "payload" dictionary
+        if userInfo == nil, let wrap = full["payload"] as? [AnyHashable: Any] {
+            logger.info("🔍 found top-level \"payload\" dictionary – keys: \(wrap.keys)")
+            userInfo = wrap
+        }
+
+        // NEW: Also check for your "custom_payload" structure
+        if userInfo == nil, let customPayload = full["custom_payload"] as? [AnyHashable: Any] {
+            logger.info("🔍 found top-level \"custom_payload\" dictionary – keys: \(customPayload.keys)")
+            userInfo = customPayload
+        }
+
+        guard let info = userInfo else {
+            logger.error("❌ Invalid payload format – no nested info found, full.keys: \(full.keys)")
+            completionTimeout.cancel()
             completion()
             return
         }
+
+        logger.info("✅ using custom payload keys: \(info.keys)")
 
         guard let callId = info["callId"] as? String,
-            let callType = info["callType"] as? String,
-            let displayName = info["name"] as? String
-        else {
-            logger
-                .error(
-                    "❌ Missing required fields in VoIP payload: callId, callType, or name."
-                )
-            completionTimeout.cancel() // Defuse the timer
+              let callType = info["callType"] as? String,
+              let displayName = info["name"] as? String else {
+            logger.error("❌ Missing required fields in VoIP payload: callId, callType, or name. Available keys: \(info.keys)")
+            completionTimeout.cancel()
             completion()
             return
         }
 
-        let pictureUrl = info["pictureUrl"] as? String
-        let metadata = info["metadata"] as? String
+        // Use the more flexible field name checking from your old version
+        let pictureUrl = info["pictureUrl"] as? String ?? info["picture"] as? String
+        let metadata = info["metadata"] as? String ?? info["data"] as? String
 
         logger.info("📞 Reporting incoming call from VoIP push: \(callId)")
 
-        // Delegate the call reporting to the CallEngine.
-        // The CallEngine is self-initializing, making this call safe.
+        // Report to CallEngine
         CallEngine.shared.reportIncomingCall(
             callId: callId,
             callType: callType,
@@ -138,8 +174,7 @@ class VoIPTokenManager: NSObject, PKPushRegistryDelegate {
             metadata: metadata
         ) { success in
             self.logger.info("📞 CallKit report from VoIP push completed. Success: \(success)")
-            // This is the crucial call to satisfy the PushKit watchdog.
-            completionTimeout.cancel() // Defuse the timer
+            completionTimeout.cancel()
             completion()
         }
     }
