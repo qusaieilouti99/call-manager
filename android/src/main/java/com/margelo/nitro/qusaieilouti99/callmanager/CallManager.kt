@@ -112,7 +112,7 @@ class CallManager : HybridCallManagerSpec() {
         return CallEngine.isCallActive()
     }
 
-    override fun reportIncomingCall(callId: String, callType: String, targetName: String, metadata: String?) {
+    override fun reportIncomingCall(callId: String, callType: String, targetName: String, metadata: String?, token: String?, rejectEndpoint: String?) {
         Log.d(TAG, "reportIncomingCall requested: callId=$callId, callType=$callType, targetName=$targetName")
         ensureInitialized()
         CallEngine.reportIncomingCall(
@@ -121,7 +121,9 @@ class CallManager : HybridCallManagerSpec() {
           callType,
           targetName,
           null,
-          metadata
+          metadata,
+          token,
+          rejectEndpoint
         )
     }
 

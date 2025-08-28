@@ -4,6 +4,7 @@ import AVFoundation
 import OSLog
 import WebRTC
 import UIKit
+import ChatSharedDataManager
 
 /// The central controller for all call-related activities.
 /// This class manages call state, interacts with the `CallKitManager`,
@@ -34,6 +35,10 @@ class CallEngine {
 
     private init() {
         logger.info("CallEngine singleton created.")
+    }
+
+    private func getBundleIdentifier() -> String {
+        return Bundle.main.bundleIdentifier ?? "unknown.bundle.id"
     }
 
     // MARK: - Public Setup
@@ -264,10 +269,21 @@ class CallEngine {
     private func endCallInternal(callId: String) {
         logger.info("Ending call internally: \(callId)")
 
+        // Get the call info before removing it to check if it was rejected
+        guard let callInfo = activeCalls[callId] else { return }
+
+        // Check if this was an incoming call being rejected
+        if callInfo.state == .incoming {
+            logger.info("Incoming call rejected: \(callId)")
+            let bundleId = getBundleIdentifier()
+            ChatSharedDataManager.shared.sendRejectCall(callId: callId, hostAppBundleId: bundleId)
+        }
+
         // For the CALL_ENDED event, JS only expects the callId.
         let payload = ["callId": callId]
 
-        guard activeCalls.removeValue(forKey: callId) != nil else { return }
+        // Remove the call from active calls
+        activeCalls.removeValue(forKey: callId)
         callMetadata.removeValue(forKey: callId)
 
         // If this was the last active call, deactivate the audio session.

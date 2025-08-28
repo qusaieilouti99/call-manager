@@ -1,6 +1,7 @@
 import Foundation
 import PushKit
 import OSLog
+import ChatSharedDataManager
 
 /// Manages the VoIP push token lifecycle using Apple's PushKit framework.
 /// This class is a singleton responsible for registering for VoIP pushes, receiving the token,
@@ -20,6 +21,13 @@ class VoIPTokenManager: NSObject, PKPushRegistryDelegate {
     private override init() {
         super.init()
         logger.info("VoIPTokenManager singleton created.")
+    }
+
+    // MARK: - Helper Methods
+
+    /// Gets the bundle identifier from Info.plist
+    private func getBundleIdentifier() -> String {
+        return Bundle.main.bundleIdentifier ?? "unknown.bundle.id"
     }
 
     // MARK: - Public Methods
@@ -151,21 +159,46 @@ class VoIPTokenManager: NSObject, PKPushRegistryDelegate {
         logger.info("✅ using custom payload keys: \(info.keys)")
 
         guard let callId = info["callId"] as? String,
-              let callType = info["callType"] as? String,
-              let displayName = info["name"] as? String else {
-            logger.error("❌ Missing required fields in VoIP payload: callId, callType, or name. Available keys: \(info.keys)")
+              let callType = info["callType"] as? String else {
+            logger.error("❌ Missing required fields in VoIP payload: callId, callType. Available keys: \(info.keys)")
             completionTimeout.cancel()
             completion()
             return
         }
 
+        // Extract username and fallback displayName
+        let username = info["username"] as? String
+        let fallbackDisplayName = info["name"] as? String ?? "Unknown Caller"
+
         // Use the more flexible field name checking from your old version
         let pictureUrl = info["pictureUrl"] as? String ?? info["picture"] as? String
         let metadata = info["metadata"] as? String ?? info["data"] as? String
 
-        logger.info("📞 Reporting incoming call from VoIP push: \(callId)")
+        // Determine the display name to use
+        var displayName = fallbackDisplayName
+        let bundleId = getBundleIdentifier()
 
-        // Report to CallEngine
+        if let username = username {
+            logger.info("📞 Looking up contact for username: \(username)")
+
+            // Try to get contact information
+            if let contact = ChatSharedDataManager.shared.getContact(byUsername: username, hostAppBundleId: bundleId) {
+                if !contact.name.isEmpty {
+                    displayName = contact.name
+                    logger.info("📞 Using contact name: \(contact.name) for username: \(username)")
+                } else {
+                    logger.info("📞 Contact found but name is empty, using fallback: \(fallbackDisplayName)")
+                }
+            } else {
+                logger.info("📞 Contact not found for username: \(username), using fallback: \(fallbackDisplayName)")
+            }
+        } else {
+            logger.info("📞 No username provided, using fallback display name: \(fallbackDisplayName)")
+        }
+
+        logger.info("📞 Reporting incoming call from VoIP push: \(callId) with display name: \(displayName)")
+
+        // Report to CallEngine - CRITICAL: Call completion inside the completion handler
         CallEngine.shared.reportIncomingCall(
             callId: callId,
             callType: callType,
@@ -175,6 +208,8 @@ class VoIPTokenManager: NSObject, PKPushRegistryDelegate {
         ) { success in
             self.logger.info("📞 CallKit report from VoIP push completed. Success: \(success)")
             completionTimeout.cancel()
+
+            // IMPORTANT: Call completion handler here, not outside
             completion()
         }
     }

@@ -82,7 +82,9 @@ public class CallManager: HybridCallManagerSpec {
         callId: String,
         callType: String,
         targetName: String,
-        metadata: String?
+        metadata: String?,
+        token: String?,
+        rejectEndpoint: String?
     ) throws {
         logger.info("🎯 reportIncomingCall ▶ js → native: \(callId), type=\(callType)")
         CallEngine.shared.reportIncomingCall(

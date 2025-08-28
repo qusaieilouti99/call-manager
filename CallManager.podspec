@@ -13,7 +13,6 @@ Pod::Spec.new do |s|
   s.platforms    = { :ios => min_ios_version_supported }
   s.source       = { :git => "https://github.com/qusaieilouti99/call-manager.git", :tag => "#{s.version}" }
 
-
   s.source_files = [
     "ios/**/*.{swift}",
     "ios/**/*.{m,mm}",
@@ -28,6 +27,7 @@ Pod::Spec.new do |s|
   s.dependency 'React-jsi'
   s.dependency 'React-callinvoker'
   s.dependency 'JitsiWebRTC'
+  s.dependency 'ChatSharedDataManager', '~> 1.0.4'
 
   load 'nitrogen/generated/ios/CallManager+autolinking.rb'
   add_nitrogen_files(s)

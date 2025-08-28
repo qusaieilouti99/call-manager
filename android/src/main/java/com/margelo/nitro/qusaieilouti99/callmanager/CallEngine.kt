@@ -39,6 +39,13 @@ import android.app.KeyguardManager
 import java.util.UUID
 import android.provider.Settings // Import for Settings.canDrawOverlays and ACTION_MANAGE_OVERLAY_PERMISSION
 import android.view.WindowManager // For WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 // The CallEventType enum is now imported from its generated package, no manual definition needed.
 
 
@@ -117,6 +124,11 @@ object CallEngine {
 
   // This specifically tracks if MainActivity is in the foreground
   private var isMainActivityCurrentlyVisible = false // NEW: Track MainActivity visibility
+
+  // New properties for call rejection
+  private val callTokens = ConcurrentHashMap<String, String>()
+  private val callRejectEndpoints = ConcurrentHashMap<String, String>()
+  private val httpClient = OkHttpClient() // Reuse HTTP client
 
   private val lifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
       override fun onActivityResumed(activity: Activity) {
@@ -308,7 +320,9 @@ object CallEngine {
     callType: String,
     displayName: String,
     pictureUrl: String? = null,
-    metadata: String? = null
+    metadata: String? = null,
+    token: String? = null,
+    rejectEndpoint: String? = null
   ) {
     if (!isInitialized.get()) {
       initialize(context)
@@ -316,6 +330,10 @@ object CallEngine {
 
     Log.d(TAG, "reportIncomingCall: callId=$callId, type=$callType, name=$displayName")
     metadata?.let { callMetadata[callId] = it }
+
+    // Store token and reject endpoint for this call
+    token?.let { callTokens[callId] = it }
+    rejectEndpoint?.let { callRejectEndpoints[callId] = it }
 
     val incomingCall = activeCalls.values.find { it.state == CallState.INCOMING }
     if (incomingCall != null) {
@@ -761,9 +779,18 @@ object CallEngine {
       return
     }
 
+    // Send rejection request if this was an incoming call being rejected
+    if (callInfo.state == CallState.INCOMING) {
+      sendCallRejectionRequest(callId)
+    }
+
     val metadata = callMetadata.remove(callId)
     activeCalls.remove(callId)
-    callAnswerStates.remove(callId) // Clean up answer state
+    callAnswerStates.remove(callId)
+
+    // Clean up token and endpoint
+    callTokens.remove(callId)
+    callRejectEndpoints.remove(callId)
 
     stopRingback()
     stopRingtone()
@@ -1669,6 +1696,52 @@ object CallEngine {
       Settings.canDrawOverlays(context)
     } else {
       true // Permissions granted at install time for older Android versions
+    }
+  }
+
+  /**
+   * Sends HTTP POST request to reject endpoint when call is rejected
+   */
+  private fun sendCallRejectionRequest(callId: String) {
+    val token = callTokens[callId]
+    val endpoint = callRejectEndpoints[callId]
+
+    if (token.isNullOrBlank() || endpoint.isNullOrBlank()) {
+      Log.d(TAG, "No token or reject endpoint for callId: $callId, skipping rejection request")
+      return
+    }
+
+    CoroutineScope(Dispatchers.IO).launch {
+      try {
+        val requestBody = JSONObject().apply {
+          put("callId", callId)
+        }
+
+        val request = okhttp3.Request.Builder()
+          .url(endpoint)
+          .addHeader("Authorization", "Bearer $token")
+          .addHeader("Content-Type", "application/json")
+          .post(
+            requestBody.toString().toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
+          )
+          .build()
+
+        httpClient.newCall(request).execute().use { response ->
+          if (response.isSuccessful) {
+            Log.d(TAG, "Call rejection sent successfully for callId: $callId")
+            response.body?.string()?.let { responseBody ->
+              Log.d(TAG, "Response: $responseBody")
+            }
+          } else {
+            Log.e(TAG, "Failed to send call rejection for callId: $callId, response: ${response.code}")
+            response.body?.string()?.let { errorBody ->
+              Log.e(TAG, "Error response: $errorBody")
+            }
+          }
+        }
+      } catch (e: Exception) {
+        Log.e(TAG, "Error sending call rejection request for callId: $callId", e)
+      }
     }
   }
 

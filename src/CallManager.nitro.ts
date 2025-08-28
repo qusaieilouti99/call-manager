@@ -47,7 +47,9 @@ export interface CallManager
     callId: string,
     callType: string,
     targetName: string,
-    metadata?: string
+    metadata?: string,
+    token?: string,
+    rejectEndpoint?: string
   ): void;
 
   // Event emitter: addListener returns a remove function
