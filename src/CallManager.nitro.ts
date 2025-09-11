@@ -53,15 +53,19 @@ export interface CallManager
   ): void;
 
   // Event emitter: addListener returns a remove function
-  addListener(
+  addCallListener(
     // Payload for AUDIO_DEVICES_CHANGED now matches AudioDeviceInfo structure
     listener: (event: CallEventType, payload: string) => void
-  ): () => void;
+  ): void;
+
+  removeCallListener(): void;
 
   registerVoIPTokenListener(
     // token payload
     listener: (payload: string) => void
-  ): () => void;
+  ): void;
+
+  removeVoipTokenListener(): void;
 
   hasActiveCall(): boolean; // if there is an active call, no matter ringing, incoming, outgoing, whatever
 

@@ -64,7 +64,10 @@ export const callAnswered = (callId: string) => {
 // Event emitter: addListener returns a remove function
 export const addCallManagerListener = (
   listener: (event: CallEventType, payload: string) => void
-): (() => void) => CallManagerHybridObject.addListener(listener);
+) => CallManagerHybridObject.addCallListener(listener);
+
+export const removeCallManagerListener = () =>
+  CallManagerHybridObject.removeCallListener();
 
 export type { CallEventType };
 

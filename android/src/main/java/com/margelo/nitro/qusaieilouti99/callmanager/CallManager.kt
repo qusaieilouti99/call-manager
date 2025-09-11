@@ -2,18 +2,23 @@ package com.margelo.nitro.qusaieilouti99.callmanager
 
 import android.util.Log
 import com.facebook.proguard.annotations.DoNotStrip
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 @DoNotStrip
 class CallManager : HybridCallManagerSpec() {
 
     private val TAG = "CallManager"
+    private val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     private fun ensureInitialized() {
         if (!CallEngine.isInitialized()) {
             Log.e(TAG, "CallEngine not initialized! This should not happen if Application.onCreate() was called properly.")
             throw IllegalStateException(
                 "CallEngine must be initialized in Application.onCreate(). " +
-                "Make sure MainApplication.onCreate() calls CallEngine.initialize(this) before any native calls."
+                    "Make sure MainApplication.onCreate() calls CallEngine.initialize(this) before any native calls."
             )
         }
     }
@@ -51,18 +56,40 @@ class CallManager : HybridCallManagerSpec() {
     override fun keepScreenAwake(keepAwake: Boolean): Unit {
         Log.d(TAG, "keepScreenAwake requested: $keepAwake")
         ensureInitialized()
-        // Delegate screen awake control to CallEngine's unified mechanism
         CallEngine.setIdleTimerDisabled(keepAwake)
     }
 
-    override fun addListener(listener: (event: CallEventType, payload: String) -> Unit): () -> Unit {
-        Log.d(TAG, "addListener called")
+    override fun addCallListener(listener: (event: CallEventType, payload: String) -> Unit): Unit {
+        Log.d(TAG, "addCallListener called")
         ensureInitialized()
-        CallEngine.setEventHandler(listener)
-        return {
-            CallEngine.setEventHandler(null)
-            Log.d(TAG, "Listener removed.")
+
+        val wrapped: (CallEventType, String) -> Unit = { event, payload ->
+            mainScope.launch {
+                try {
+                    listener(event, payload)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error executing JS call listener", e)
+                }
+            }
         }
+
+        CallEngine.setEventHandler(wrapped)
+    }
+
+    override fun removeCallListener(): Unit {
+        Log.d(TAG, "removeCallListener called")
+        ensureInitialized()
+        CallEngine.setEventHandler(null)
+    }
+
+    override fun registerVoIPTokenListener(listener: (payload: String) -> Unit): Unit {
+        Log.d(TAG, "registerVoIPTokenListener called")
+
+    }
+
+    override fun removeVoipTokenListener(): Unit {
+        Log.d(TAG, "removeVoipTokenListener called")
+
     }
 
     override fun startOutgoingCall(callId: String, callType: String, targetName: String, metadata: String?): Unit {
@@ -80,7 +107,7 @@ class CallManager : HybridCallManagerSpec() {
     override fun callAnswered(callId: String): Unit {
         Log.d(TAG, "callAnswered (from JS) requested for callId: $callId")
         ensureInitialized()
-        CallEngine.answerCall(callId, isLocalAnswer = false) // Remote party answered
+        CallEngine.answerCall(callId, isLocalAnswer = false)
     }
 
     override fun setOnHold(callId: String, onHold: Boolean): Unit {
@@ -96,14 +123,29 @@ class CallManager : HybridCallManagerSpec() {
     }
 
     override fun updateDisplayCallInformation(callId: String, callerName: String): Unit {
-        // do nothing for now
+        // no-op
     }
 
-    override fun registerVoIPTokenListener(listener: (payload: String) -> Unit): () -> Unit {
-        Log.d(TAG, "registerVoIPTokenListener called")
-        return {
-            Log.d(TAG, "registerVoIPTokenListener removed.")
-        }
+    override fun reportIncomingCall(
+        callId: String,
+        callType: String,
+        targetName: String,
+        metadata: String?,
+        token: String?,
+        rejectEndpoint: String?
+    ) {
+        Log.d(TAG, "reportIncomingCall requested: callId=$callId, callType=$callType, targetName=$targetName")
+        ensureInitialized()
+        CallEngine.reportIncomingCall(
+            requireNotNull(CallEngine.getContext()) { "CallEngine must be initialized with context" },
+            callId,
+            callType,
+            targetName,
+            null,
+            metadata,
+            token,
+            rejectEndpoint
+        )
     }
 
     override fun hasActiveCall(): Boolean {
@@ -112,34 +154,17 @@ class CallManager : HybridCallManagerSpec() {
         return CallEngine.isCallActive()
     }
 
-    override fun reportIncomingCall(callId: String, callType: String, targetName: String, metadata: String?, token: String?, rejectEndpoint: String?) {
-        Log.d(TAG, "reportIncomingCall requested: callId=$callId, callType=$callType, targetName=$targetName")
-        ensureInitialized()
-        CallEngine.reportIncomingCall(
-          requireNotNull(CallEngine.getContext()) { "CallEngine must be initialized with context" },
-          callId,
-          callType,
-          targetName,
-          null,
-          metadata,
-          token,
-          rejectEndpoint
-        )
-    }
-
-    // --- New Hybrid Method for SYSTEM_ALERT_WINDOW permission CHECK ---
-    override fun hasOverlayPermissionAndroid(): Boolean {
-        Log.d(TAG, "hasOverlayPermissionAndroid requested (check only)")
-        ensureInitialized()
-        val context = requireNotNull(CallEngine.getContext()) { "CallEngine must be initialized with context" }
-        return CallEngine.checkOverlayPermissionGranted(context)
-    }
-
-    // --- Repurposed Hybrid Method for SYSTEM_ALERT_WINDOW permission LAUNCH ---
     override fun requestOverlayPermissionAndroid(): Boolean {
         Log.d(TAG, "requestOverlayPermissionAndroid requested (launch settings)")
         ensureInitialized()
-        val context = requireNotNull(CallEngine.getContext()) { "CallEngine must be initialized with context" }
-        return CallEngine.launchOverlayPermissionSettings(context)
+        val ctx = requireNotNull(CallEngine.getContext()) { "CallEngine must be initialized with context" }
+        return CallEngine.launchOverlayPermissionSettings(ctx)
+    }
+
+    override fun hasOverlayPermissionAndroid(): Boolean {
+        Log.d(TAG, "hasOverlayPermissionAndroid requested (check only)")
+        ensureInitialized()
+        val ctx = requireNotNull(CallEngine.getContext()) { "CallEngine must be initialized with context" }
+        return CallEngine.checkOverlayPermissionGranted(ctx)
     }
 }
