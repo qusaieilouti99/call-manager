@@ -33,6 +33,8 @@ class CallEngine {
     private var isInitialized = false
     private var manualIdleTimerDisabled: Bool = false
 
+    private var audioPlayer: AVAudioPlayer?
+
     private init() {
         logger.info("CallEngine singleton created.")
     }
@@ -120,6 +122,7 @@ class CallEngine {
             state: .dialing)
         activeCalls[callId] = info
         emitCallStateChanged()
+        startRingback()
 
         callKitManager.startOutgoingCall(callInfo: info) { [weak self] error in
             if error != nil {
@@ -217,6 +220,38 @@ class CallEngine {
         callKitManager.updateCall(callId: callId, displayName: callerName)
     }
 
+    private func startRingback() {
+        stopRingback() // Stop any existing playback
+
+        logger.info("Starting ringback tone...")
+
+        // Access audio file from the library bundle
+        let libraryBundle = Bundle(for: type(of: self))
+
+        guard let url = libraryBundle.url(forResource: "ringback_tone", withExtension: "wav") else {
+            logger.error("❌ Could not find ringback_tone.wav in library bundle")
+            return
+        }
+
+        do {
+            audioPlayer = try AVAudioPlayer(contentsOf: url)
+            audioPlayer?.numberOfLoops = -1
+            audioPlayer?.volume = 1.0
+            audioPlayer?.play()
+            logger.info("✅ Ringback started")
+        } catch {
+            logger.error("❌ Failed to play ringback: \(error.localizedDescription)")
+            audioPlayer = nil
+        }
+    }
+
+    private func stopRingback() {
+        guard audioPlayer?.isPlaying == true else { return }
+        audioPlayer?.stop()
+        audioPlayer = nil
+        logger.info("✅ Ringback stopped")
+    }
+
     func getAudioDevices() -> AudioRoutesInfo {
         return audioManager.getAudioDevices()
     }
@@ -293,6 +328,7 @@ class CallEngine {
 
         emitEvent(.callEnded, data: payload)
         emitCallStateChanged()
+        stopRingback()
     }
 
     // MARK: - Event Emission
@@ -366,6 +402,7 @@ extension CallEngine: CallKitManagerDelegate {
         } else {
             emitEvent(.callAnswered, data: payload)
         }
+        stopRingback()
     }
 
     func callKitManager(_ manager: CallKitManager, didStartOutgoingCall callId: String) {

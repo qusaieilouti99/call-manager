@@ -1,5 +1,5 @@
 package com.margelo.nitro.qusaieilouti99.callmanager
-
+import android.media.AudioFocusRequest
 import android.app.Activity
 import android.app.ActivityManager
 import android.app.Application
@@ -37,8 +37,8 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import android.app.KeyguardManager
 import java.util.UUID
-import android.provider.Settings // Import for Settings.canDrawOverlays and ACTION_MANAGE_OVERLAY_PERMISSION
-import android.view.WindowManager // For WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+import android.provider.Settings
+import android.view.WindowManager
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -46,7 +46,6 @@ import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-// The CallEventType enum is now imported from its generated package, no manual definition needed.
 
 
 /**
@@ -61,6 +60,10 @@ object CallEngine {
   private const val PHONE_ACCOUNT_ID = "com.qusaieilouti99.callmanager.SELF_MANAGED"
   private const val NOTIF_CHANNEL_ID = "incoming_call_channel"
   private const val NOTIF_ID = 2001
+
+  // ✅ ADD THIS: Direct reference to prevent resource shrinking
+  @Suppress("unused")
+  private val KEEP_RINGBACK_RESOURCE = R.raw.ringback_tone
 
   interface CallEndListener {
     fun onCallEnded(callId: String)
@@ -85,12 +88,14 @@ object CallEngine {
   private var ringbackPlayer: MediaPlayer? = null
   private var vibrator: Vibrator? = null
   private var audioManager: AudioManager? = null
-  private var wakeLock: PowerManager.WakeLock? = null // Using SCREEN_BRIGHT_WAKE_LOCK now
+  private var wakeLock: PowerManager.WakeLock? = null
 
   private val activeCalls = ConcurrentHashMap<String, CallInfo>()
   private val telecomConnections = ConcurrentHashMap<String, Connection>()
   private val callMetadata = ConcurrentHashMap<String, String>()
   private val callAnswerStates = ConcurrentHashMap<String, Boolean>()
+
+  private var audioFocusRequest: AudioFocusRequest? = null
 
   private var currentCallId: String? = null
   private var canMakeMultipleCalls: Boolean = false
@@ -306,7 +311,7 @@ object CallEngine {
   }
 
   fun getCurrentCallState(): String {
-    val calls = CallEngine.getActiveCalls()
+    val calls = getActiveCalls()
     val jsonArray = JSONArray()
     calls.forEach {
       jsonArray.put(it.toJsonObject())
@@ -331,7 +336,6 @@ object CallEngine {
     Log.d(TAG, "reportIncomingCall: callId=$callId, type=$callType, name=$displayName")
     metadata?.let { callMetadata[callId] = it }
 
-    // Store token and reject endpoint for this call
     token?.let { callTokens[callId] = it }
     rejectEndpoint?.let { callRejectEndpoints[callId] = it }
 
@@ -365,23 +369,22 @@ object CallEngine {
     currentCallId = callId
     Log.d(TAG, "Call $callId added to activeCalls. State: INCOMING")
 
-    startForegroundService() // Ensure foreground service is started for incoming
-    updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
-    emitCallStateChanged() // NEW: Emit call state changed event
+    startForegroundService()
+    updateOverallIdleTimerDisabledState()
+    emitCallStateChanged()
 
     showIncomingCallUI(callId, displayName, callType, pictureUrl)
     registerPhoneAccount()
 
     val telecomManager =
       requireContext().getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-    val phoneAccountHandle = CallEngine.getPhoneAccountHandle()
+    val phoneAccountHandle = getPhoneAccountHandle()
     val extras = Bundle().apply {
       putString(MyConnectionService.EXTRA_CALL_ID, callId)
       putString(MyConnectionService.EXTRA_CALL_TYPE, callType)
       putString(MyConnectionService.EXTRA_DISPLAY_NAME, displayName)
       putBoolean(MyConnectionService.EXTRA_IS_VIDEO_CALL_BOOLEAN, isVideoCall)
       pictureUrl?.let { putString(MyConnectionService.EXTRA_PICTURE_URL, it) }
-      // TelecomManager.EXTRA_INCOMING_VIDEO_STATE is used here to hint the video state to Telecom
       putInt(TelecomManager.EXTRA_INCOMING_VIDEO_STATE, if (isVideoCall) VideoProfile.STATE_BIDIRECTIONAL else VideoProfile.STATE_AUDIO_ONLY)
     }
 
@@ -390,7 +393,7 @@ object CallEngine {
       Log.d(TAG, "Successfully reported incoming call to TelecomManager for $callId")
     } catch (e: Exception) {
       Log.e(TAG, "Failed to report incoming call: ${e.message}", e)
-      endCallInternal(callId) // Clean up if Telecom fails
+      endCallInternal(callId)
     }
 
     updateLockScreenBypass()
@@ -457,11 +460,12 @@ object CallEngine {
 
     try {
       telecomManager.placeCall(addressUri, placeCallExtras)
-      bringAppToForeground() // Try to bring app to foreground
+      startRingback()
+      bringAppToForeground()
       Log.d(TAG, "Successfully reported outgoing call to TelecomManager")
     } catch (e: Exception) {
       Log.e(TAG, "Failed to start outgoing call: ${e.message}", e)
-      endCallInternal(callId) // Clean up if Telecom fails
+      endCallInternal(callId)
     }
 
     updateLockScreenBypass()
@@ -510,14 +514,14 @@ object CallEngine {
     currentCallId = callId
     Log.d(TAG, "Call $callId added to activeCalls. Initial state: DIALING (for Telecom)")
 
-    startForegroundService() // Ensure foreground service is started
-    updateOverallIdleTimerDisabledState() // NEW: Update screen awake state
-    emitCallStateChanged() // NEW: Emit call state changed event
+    startForegroundService()
+    updateOverallIdleTimerDisabledState()
+    emitCallStateChanged()
 
     registerPhoneAccount()
 
     val telecomManager = requireContext().getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-    val phoneAccountHandle = CallEngine.getPhoneAccountHandle()
+    val phoneAccountHandle = getPhoneAccountHandle()
     val addressUri = Uri.fromParts(PhoneAccount.SCHEME_TEL, targetName, null)
 
     val outgoingExtrasForConnectionService = Bundle().apply {
@@ -537,14 +541,13 @@ object CallEngine {
 
     try {
       telecomManager.placeCall(addressUri, placeCallExtras)
-      bringAppToForeground() // Try to bring app to foreground
+      bringAppToForeground()
       Log.d(TAG, "Successfully reported outgoing call (to be immediately active) to TelecomManager for $callId")
 
-      // Immediately mark as answered for "startCall" behavior
-      answerCall(callId, isLocalAnswer = false) // Remote party answered, not local UI initiated
+      answerCall(callId, isLocalAnswer = false)
     } catch (e: Exception) {
       Log.e(TAG, "Failed to start call as active: ${e.message}", e)
-      endCallInternal(callId) // Clean up if Telecom fails
+      endCallInternal(callId)
     }
     updateLockScreenBypass()
   }
@@ -690,7 +693,7 @@ object CallEngine {
     updateForegroundNotification()
     emitEvent(CallEventType.CALL_HELD, JSONObject().put("callId", callId))
     updateLockScreenBypass()
-    emitCallStateChanged() // NEW: Emit call state changed event
+    emitCallStateChanged()
   }
 
   fun unholdCall(callId: String) {
@@ -714,7 +717,7 @@ object CallEngine {
     updateForegroundNotification()
     emitEvent(CallEventType.CALL_UNHELD, JSONObject().put("callId", callId))
     updateLockScreenBypass()
-    emitCallStateChanged() // NEW: Emit call state changed event
+    emitCallStateChanged()
   }
 
   fun muteCall(callId: String) {
@@ -763,12 +766,11 @@ object CallEngine {
       endCallInternal(callId)
     }
 
-    // Explicitly ensure cleanup and state reset if somehow not all calls ended cleanly
     if (activeCalls.isEmpty()) {
       cleanup()
     }
     updateLockScreenBypass()
-    emitCallStateChanged() // NEW: Emit call state changed event
+    emitCallStateChanged()
   }
 
   private fun endCallInternal(callId: String) {
@@ -863,9 +865,9 @@ object CallEngine {
   @Suppress("NewApi")
   fun onTelecomAudioRouteChanged(callId: String, callEndpoint: android.telecom.CallEndpoint) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-      Log.d(TAG, "Telecom audio route changed for $callId: endpoint=${callEndpoint.endpointName} (type=${CallEngine.mapCallEndpointTypeToString(callEndpoint.endpointType)})")
+      Log.d(TAG, "Telecom audio route changed for $callId: endpoint=${callEndpoint.endpointName} (type=${mapCallEndpointTypeToString(callEndpoint.endpointType)})")
       currentActiveCallEndpoint = callEndpoint
-      emitAudioRouteChanged(CallEngine.mapCallEndpointTypeToString(callEndpoint.endpointType))
+      emitAudioRouteChanged(mapCallEndpointTypeToString(callEndpoint.endpointType))
     }
   }
 
@@ -881,9 +883,8 @@ object CallEngine {
   private fun getModernAudioDevices(): AudioRoutesInfo {
     @Suppress("UNCHECKED_CAST")
     val endpoints = availableCallEndpoints as? List<android.telecom.CallEndpoint> ?: emptyList()
-    val devices = endpoints.map { StringHolder(CallEngine.mapCallEndpointTypeToString(it.endpointType)) }.toMutableSet()
+    val devices = endpoints.map { StringHolder(mapCallEndpointTypeToString(it.endpointType)) }.toMutableSet()
 
-    // Ensure Earpiece and Speaker are always listed if they are valid output types
     if (endpoints.none { it.endpointType == android.telecom.CallEndpoint.TYPE_EARPIECE }) {
         devices.add(StringHolder("Earpiece"))
     }
@@ -892,7 +893,7 @@ object CallEngine {
     }
 
     val currentEndpoint = currentActiveCallEndpoint as? android.telecom.CallEndpoint
-    val current = currentEndpoint?.let { CallEngine.mapCallEndpointTypeToString(it.endpointType) } ?: "Unknown"
+    val current = currentEndpoint?.let { mapCallEndpointTypeToString(it.endpointType) } ?: "Unknown"
 
     Log.d(TAG, "Modern audio devices: ${devices.map { it.value }}, current: $current")
     return AudioRoutesInfo(devices.toTypedArray(), current)
@@ -918,18 +919,18 @@ object CallEngine {
 
   @Suppress("NewApi")
   private fun setModernAudioRoute(route: String) {
-    val telecomEndpointType = CallEngine.mapStringToCallEndpointType(route)
+    val telecomEndpointType = mapStringToCallEndpointType(route)
     @Suppress("UNCHECKED_CAST")
     val endpoints = availableCallEndpoints as? List<android.telecom.CallEndpoint> ?: emptyList()
 
     val targetEndpoint = endpoints.find { it.endpointType == telecomEndpointType }
-        ?: CallEngine.getOrCreateGenericCallEndpoint(telecomEndpointType, route)
+        ?: getOrCreateGenericCallEndpoint(telecomEndpointType, route)
 
     if (targetEndpoint != null) {
       currentCallId?.let { callId ->
         telecomConnections[callId]?.let { connection ->
           if (connection is MyConnection) {
-            Log.d(TAG, "Requesting modern telecom audio route to: ${targetEndpoint.endpointName} (type: ${CallEngine.mapCallEndpointTypeToString(targetEndpoint.endpointType)})")
+            Log.d(TAG, "Requesting modern telecom audio route to: ${targetEndpoint.endpointName} (type: ${mapCallEndpointTypeToString(targetEndpoint.endpointType)})")
             connection.setTelecomAudioRoute(targetEndpoint)
           } else {
             Log.w(TAG, "Telecom connection for $callId is not MyConnection instance. Cannot set modern audio route.")
@@ -1016,7 +1017,6 @@ object CallEngine {
     }
   }
 
-  // Legacy method for MyConnection fallback
   fun setLegacyAudioRoute(endpoint: String) {
       setLegacyAudioRouteDirect(endpoint)
   }
@@ -1038,9 +1038,9 @@ object CallEngine {
 
     mainHandler.postDelayed({
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-        CallEngine.setModernAudioRoute(targetRoute)
+        setModernAudioRoute(targetRoute)
       } else {
-        CallEngine.setLegacyAudioRouteDirect(targetRoute)
+        setLegacyAudioRouteDirect(targetRoute)
       }
     }, 500L)
   }
@@ -1051,7 +1051,7 @@ object CallEngine {
   }
 
   private fun resetAudioMode() {
-    if (CallEngine.activeCalls.isEmpty()) {
+    if (activeCalls.isEmpty()) {
       audioManager?.let { am ->
         am.mode = AudioManager.MODE_NORMAL
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && @Suppress("DEPRECATION") am.isBluetoothScoOn) {
@@ -1127,7 +1127,6 @@ object CallEngine {
   private fun updateLegacyAvailableAudioDevices() {
     val devices = mutableSetOf<String>()
 
-    // Always available
     devices.add("Earpiece")
     devices.add("Speaker")
 
@@ -1175,7 +1174,7 @@ object CallEngine {
   }
 
   private fun emitAudioRouteChanged(currentRoute: String) {
-    val info = CallEngine.getAudioDevices()
+    val info = getAudioDevices()
     val deviceStrings = info.devices.map { it.value }
     val payload = JSONObject().apply {
       put("devices", JSONArray(deviceStrings))
@@ -1186,7 +1185,7 @@ object CallEngine {
   }
 
   private fun emitAudioDevicesChanged() {
-    val info = CallEngine.getAudioDevices()
+    val info = getAudioDevices()
     val deviceStrings = info.devices.map { it.value }
     val payload = JSONObject().apply {
       put("devices", JSONArray(deviceStrings))
@@ -1202,7 +1201,7 @@ object CallEngine {
   fun setIdleTimerDisabled(shouldDisable: Boolean) {
       Log.d(TAG, "setIdleTimerDisabled (JS requested): $shouldDisable")
       manualIdleTimerDisabled = shouldDisable
-      CallEngine.updateOverallIdleTimerDisabledState()
+      updateOverallIdleTimerDisabledState()
   }
 
   // NEW: Internal method to determine and set final idle timer state
@@ -1260,7 +1259,7 @@ object CallEngine {
       // Retaining it here for backward compatibility if directly called, but internal logic
       // is handled by updateOverallIdleTimerDisabledState based on manualIdleTimerDisabled and hasActiveCalls.
       Log.w(TAG, "DEPRECATED: CallEngine.keepScreenAwake() is deprecated. Use setIdleTimerDisabled() via CallManager instead.")
-      CallEngine.setIdleTimerDisabled(keepAwake)
+      setIdleTimerDisabled(keepAwake)
   }
 
   fun getActiveCalls(): List<CallInfo> = activeCalls.values.toList()
@@ -1318,7 +1317,7 @@ object CallEngine {
     val context = requireContext()
     Log.d(TAG, "Showing incoming call UI for $callId")
 
-    val useCallStyleNotification = CallEngine.supportsCallStyleNotifications()
+    val useCallStyleNotification = supportsCallStyleNotifications()
     Log.d(TAG, "Using CallStyle notification: $useCallStyleNotification")
 
     val isDeviceLocked = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
@@ -1473,12 +1472,12 @@ object CallEngine {
     val notificationManager =
       context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     notificationManager.cancel(NOTIF_ID)
-    CallEngine.stopRingtone()
+    stopRingtone()
   }
 
   private fun startForegroundService() {
     val context = requireContext()
-    val currentCall = CallEngine.activeCalls.values.find {
+    val currentCall = activeCalls.values.find {
       it.state == CallState.ACTIVE ||
       it.state == CallState.INCOMING ||
       it.state == CallState.DIALING ||
@@ -1532,7 +1531,7 @@ object CallEngine {
       Intent.FLAG_ACTIVITY_SINGLE_TOP
     )
 
-    if (CallEngine.isCallActive()) {
+    if (isCallActive()) {
       launchIntent?.putExtra("BYPASS_LOCK_SCREEN", true)
     }
 
@@ -1540,7 +1539,7 @@ object CallEngine {
       context.startActivity(launchIntent)
       // Small delay to allow activity to start, then update bypass.
       mainHandler.postDelayed({
-          CallEngine.updateLockScreenBypass()
+          updateLockScreenBypass()
       }, 100)
     } catch (e: Exception) {
       Log.e(TAG, "Failed to launch MainActivity: ${e.message}")
@@ -1551,7 +1550,7 @@ object CallEngine {
     val context = requireContext()
     val telecomManager =
       context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-    val phoneAccountHandle = CallEngine.getPhoneAccountHandle()
+    val phoneAccountHandle = getPhoneAccountHandle()
 
     if (telecomManager.getPhoneAccount(phoneAccountHandle) == null) {
       val phoneAccount = PhoneAccount.builder(phoneAccountHandle, "PingMe Call")
@@ -1571,7 +1570,7 @@ object CallEngine {
     val context = requireContext()
     return PhoneAccountHandle(
       ComponentName(context, MyConnectionService::class.java),
-      CallEngine.PHONE_ACCOUNT_ID
+      PHONE_ACCOUNT_ID
     )
   }
 
@@ -1616,19 +1615,79 @@ object CallEngine {
 
   private fun startRingback() {
     val context = requireContext()
-    if (ringbackPlayer?.isPlaying == true) return
+    if (ringbackPlayer?.isPlaying == true) {
+        Log.d(TAG, "Ringback already playing, skipping")
+        return
+    }
 
     try {
-      val ringbackUri =
-        Uri.parse("android.resource://${context.packageName}/raw/ringback_tone")
-      ringbackPlayer = MediaPlayer.create(context, ringbackUri)
-      ringbackPlayer?.apply {
-        isLooping = true
-        start()
-      }
-      Log.d(TAG, "Ringback tone started playing")
+        audioManager = audioManager ?: context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
+        Log.d(TAG, "✓ Audio mode set to MODE_IN_COMMUNICATION")
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(
+                    android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setWillPauseWhenDucked(false)
+                .build()
+
+            val focusResult = audioManager?.requestAudioFocus(audioFocusRequest!!)
+            Log.d(TAG, "✓ Audio focus result: $focusResult")
+        }
+
+        ringbackPlayer = MediaPlayer().apply {
+            // ✅ CHANGED: Use direct resource reference
+            val afd = context.resources.openRawResourceFd(R.raw.ringback_tone)
+            if (afd != null) {
+                setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+                afd.close()
+                Log.d(TAG, "✓ Loaded ringback from library resources")
+            } else {
+                Log.e(TAG, "❌ Could not open ringback_tone resource")
+                return
+            }
+
+            setAudioStreamType(AudioManager.STREAM_VOICE_CALL)
+            Log.d(TAG, "✓ Set audio stream to STREAM_VOICE_CALL")
+
+            setAudioAttributes(
+                android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+
+            isLooping = true
+
+            setOnPreparedListener { mp ->
+                Log.d(TAG, "✓✓✓ RINGBACK PREPARED - STARTING PLAYBACK ✓✓✓")
+                try {
+                    mp.start()
+                    Log.d(TAG, "✓ MediaPlayer.start() called successfully")
+                } catch (e: Exception) {
+                    Log.e(TAG, "❌ Error starting playback: ${e.message}", e)
+                }
+            }
+
+            setOnErrorListener { mp, what, extra ->
+                Log.e(TAG, "❌ MediaPlayer ERROR: what=$what, extra=$extra")
+                false
+            }
+
+            prepareAsync()
+            Log.d(TAG, "✓ Called prepareAsync()")
+        }
+
+        Log.d(TAG, "✓✓✓ Ringback initialization complete ✓✓✓")
     } catch (e: Exception) {
-      Log.e(TAG, "Failed to play ringback tone: ${e.message}")
+        Log.e(TAG, "❌ CRITICAL ERROR in startRingback: ${e.message}", e)
+        e.printStackTrace()
+        ringbackPlayer = null
     }
   }
 
@@ -1641,13 +1700,25 @@ object CallEngine {
     } finally {
       ringbackPlayer = null
     }
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      audioFocusRequest?.let {
+        audioManager?.abandonAudioFocusRequest(it)
+        audioFocusRequest = null
+      }
+    } else {
+      @Suppress("DEPRECATION")
+      audioManager?.abandonAudioFocus(null)
+    }
+
+    Log.d(TAG, "Ringback stopped and audio focus released")
   }
 
   private fun cleanup() {
     Log.d(TAG, "Performing cleanup")
     stopForegroundService()
-    CallEngine.updateOverallIdleTimerDisabledState()
-    CallEngine.resetAudioMode()
+    updateOverallIdleTimerDisabledState()
+    resetAudioMode()
   }
 
   fun onApplicationTerminate() {
@@ -1655,29 +1726,28 @@ object CallEngine {
     // Unregister lifecycle callbacks first to prevent further state changes during termination
     (appContext as? Application)?.unregisterActivityLifecycleCallbacks(lifecycleCallbacks)
 
-    CallEngine.activeCalls.keys.toList().forEach { callId ->
-      CallEngine.telecomConnections[callId]?.let { conn ->
+    activeCalls.keys.toList().forEach { callId ->
+      telecomConnections[callId]?.let { conn ->
         conn.setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
         conn.destroy()
       }
     }
-    CallEngine.activeCalls.clear()
-    CallEngine.telecomConnections.clear()
-    CallEngine.callMetadata.clear()
-    CallEngine.callAnswerStates.clear()
-    CallEngine.currentCallId = null
-    CallEngine.cleanup()
-    CallEngine.lockScreenBypassCallbacks.clear()
-    CallEngine.eventHandler = null
-    CallEngine.cachedEvents.clear()
-    CallEngine.isInitialized.set(false)
-    CallEngine.appContext = null
-    CallEngine.currentActiveCallEndpoint = null
-    CallEngine.availableCallEndpoints = emptyList()
-    CallEngine.wasManuallySetAudioRoute = false
-    CallEngine.previousCallStateActive = false // Reset event state
-    CallEngine.manualIdleTimerDisabled = false // Reset manual screen awake state
-    // Reset foreground detection state
+    activeCalls.clear()
+    telecomConnections.clear()
+    callMetadata.clear()
+    callAnswerStates.clear()
+    currentCallId = null
+    cleanup()
+    lockScreenBypassCallbacks.clear()
+    eventHandler = null
+    cachedEvents.clear()
+    isInitialized.set(false)
+    appContext = null
+    currentActiveCallEndpoint = null
+    availableCallEndpoints = emptyList()
+    wasManuallySetAudioRoute = false
+    previousCallStateActive = false
+    manualIdleTimerDisabled = false
     foregroundActivitiesCount = 0
     isAppCurrentlyVisible = false
     isMainActivityCurrentlyVisible = false

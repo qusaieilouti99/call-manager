@@ -19,6 +19,8 @@ Pod::Spec.new do |s|
     "cpp/**/*.{hpp,cpp}",
   ]
 
+	s.resources = 'ios/resources/**/*.{wav,mp3}'
+
   s.pod_target_xcconfig = {
     # C++ compiler flags, mainly for folly.
     "GCC_PREPROCESSOR_DEFINITIONS" => "$(inherited) FOLLY_NO_CONFIG FOLLY_CFG_NO_COROUTINES"
@@ -27,7 +29,7 @@ Pod::Spec.new do |s|
   s.dependency 'React-jsi'
   s.dependency 'React-callinvoker'
   s.dependency 'JitsiWebRTC'
-  s.dependency 'ChatSharedDataManager', '~> 1.0.4'
+  s.dependency 'ChatSharedDataManager', '~> 1.0.5'
 
   load 'nitrogen/generated/ios/CallManager+autolinking.rb'
   add_nitrogen_files(s)
